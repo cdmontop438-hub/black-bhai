@@ -646,9 +646,7 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Wait for ffmpeg to buffer, then create resource and schedule playback
-      const bufferTime = Math.min(2000, delay - 100); // Use part of the delay for buffering
-      
+      // Wait for ffmpeg to produce initial data, then create resource
       setTimeout(() => {
         console.log(`[Bot ${botNum}] Creating audio resource...`);
         let resource;
@@ -662,8 +660,7 @@ tokens.forEach((token, index) => {
           return;
         }
 
-        // Schedule playback at synchronized time
-        const remainingDelay = Math.max(0, delay - bufferTime);
+        // Give audio player time to buffer before starting playback
         setTimeout(() => {
           console.log(`[Bot ${botNum}] Starting playback...`);
           try {
@@ -675,8 +672,9 @@ tokens.forEach((token, index) => {
           } catch (err) {
             console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
           }
-        }, remainingDelay);
-      }, bufferTime);
+        }, 500); // Buffer for 500ms before playing
+        
+      }, 1500); // Wait 1500ms for ffmpeg to produce initial data
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
