@@ -134,8 +134,8 @@ tokens.forEach((token, index) => {
   let preloadedResource = null;
   let pendingFfmpeg = null; // For bkst command pre-spawned ffmpeg
 
-  // Use the new compressed audio file for all bots
-  const audioPath = path.join(__dirname, 'V.2 DARK BOOGEYMAN 4LUVONTOP (1)_compressed.mp3');
+   // Use separate audio file for each bot
+   const audioPath = path.join(__dirname, `audio${botNum}.mp3`);
 
   const spawnFfmpeg = () => {
     if (!fs.existsSync(audioPath)) return null;
