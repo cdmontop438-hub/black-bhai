@@ -13,13 +13,14 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-const { spawn } = require('child_process');
-const { PassThrough } = require('stream');
 const ffmpegPath = require('ffmpeg-static');
 
-// Ensure ffmpeg is accessible
+// Ensure ffmpeg is accessible for prism-media transcoding
 if (ffmpegPath) {
   process.env.FFMPEG_PATH = ffmpegPath;
+  console.log(`[System] FFMPEG_PATH set to ${ffmpegPath}`);
+} else {
+  console.warn('[System] ffmpeg-static not found! Audio transcoding may fail.');
 }
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
@@ -126,117 +127,27 @@ tokens.forEach((token, index) => {
   let isJoining = false;
   let audioPlayCount = 0;
   let maxAudioPlays = 10;
-  let currentFfmpeg = null;
 
-  // Use PCM files (pre-converted)
-  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
+  // FIXED: Use MP3 files (tracked by git, deployed on Render)
+  // PCM files are NOT in git and won't exist on Render
+  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
 
-  // ========== CLEANUP ==========
-  
-  const killFfmpeg = () => {
-    if (currentFfmpeg) {
-      try { 
-        currentFfmpeg.kill('SIGKILL'); 
-        console.log(`[Bot ${botNum}] FFmpeg killed`);
-      } catch (e) {}
-      currentFfmpeg = null;
-    }
-  };
+  // ========== AUDIO SYSTEM ==========
 
-  const stopPlayer = () => {
+  const setupPlayer = () => {
+    // Destroy existing player cleanly
     if (player) {
       try { player.stop(true); } catch (e) {}
       player.removeAllListeners();
       player = null;
     }
-  };
-
-  // ========== AUDIO SYSTEM ==========
-
-  const createResource = () => {
-    if (!fs.existsSync(audioPath)) {
-      console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
-      return null;
-    }
-
-    killFfmpeg();
-
-    console.log(`[Bot ${botNum}] Spawning ffmpeg...`);
-    
-    const ffmpeg = spawn(ffmpegPath, [
-      '-y',
-      '-f', 's16le',
-      '-ar', '48000',
-      '-ac', '2',
-      '-i', audioPath,
-      '-c:a', 'libopus',
-      '-b:a', '96k',
-      '-ar', '48000',
-      '-ac', '2',
-      '-f', 'ogg',
-      '-frame_duration', '20',
-      '-packet_loss', '1',
-      '-application', 'audio',
-      '-vbr', 'on',
-      'pipe:1'
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    currentFfmpeg = ffmpeg;
-
-    ffmpeg.on('error', (err) => {
-      console.error(`[Bot ${botNum}] FFmpeg error:`, err.message);
-      killFfmpeg();
-    });
-
-    ffmpeg.on('exit', (code) => {
-      if (code !== 0) {
-        console.error(`[Bot ${botNum}] FFmpeg exited with code ${code}`);
-      }
-      if (currentFfmpeg === ffmpeg) {
-        currentFfmpeg = null;
-      }
-    });
-
-    // Buffer ffmpeg output through PassThrough
-    const passThrough = new PassThrough();
-    ffmpeg.stdout.pipe(passThrough);
-
-    const resource = createAudioResource(passThrough, {
-      inputType: StreamType.OggOpus,
-      inlineVolume: true
-    });
-
-    resource.on('end', () => {
-      console.log(`[Bot ${botNum}] Resource ended`);
-      if (currentFfmpeg === ffmpeg) {
-        killFfmpeg();
-      }
-    });
-
-    resource.on('error', (err) => {
-      console.error(`[Bot ${botNum}] Resource error:`, err.message);
-      if (currentFfmpeg === ffmpeg) {
-        killFfmpeg();
-      }
-    });
-
-    return resource;
-  };
-
-  const setupPlayer = () => {
-    if (player) {
-      try { player.stop(true); } catch (e) {}
-      player.removeAllListeners();
-    }
     
     player = createAudioPlayer();
+    console.log(`[Bot ${botNum}] AudioPlayer created`);
     
     player.on('error', err => {
       console.error(`[Bot ${botNum}] Player error:`, err.message);
       if (!stopRequested) {
-        killFfmpeg();
         setTimeout(() => playTrack(), 1000);
       }
     });
@@ -244,50 +155,70 @@ tokens.forEach((token, index) => {
     player.on('stateChange', (oldState, newState) => {
       console.log(`[Bot ${botNum}] Player: ${oldState.status} -> ${newState.status}`);
       if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
-        killFfmpeg();
-        setTimeout(() => playTrack(), 100);
+        if (audioPlayCount < maxAudioPlays) {
+          setTimeout(() => playTrack(), 100);
+        } else {
+          console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
+        }
       }
     });
     
+    // Subscribe player to connection
     if (connection) {
       connection.subscribe(player);
+      console.log(`[Bot ${botNum}] AudioPlayer subscribed to connection`);
+    } else {
+      console.error(`[Bot ${botNum}] No connection to subscribe player to`);
     }
   };
 
   const playTrack = () => {
-    if (stopRequested) return;
+    if (stopRequested) {
+      console.log(`[Bot ${botNum}] playTrack: stopped`);
+      return;
+    }
     if (audioPlayCount >= maxAudioPlays) {
       console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
       return;
     }
+    
     audioPlayCount++;
     console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
 
+    // Check file exists
     if (!fs.existsSync(audioPath)) {
-      console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
+      console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
       return;
     }
+    console.log(`[Bot ${botNum}] Audio file exists: ${audioPath}`);
 
-    const resource = createResource();
-    if (!resource) {
-      if (!stopRequested) {
-        setTimeout(() => playTrack(), 1000);
-      }
-      return;
-    }
+    // FIXED: Use StreamType.Arbitrary for MP3 files
+    // prism-media will use ffmpeg to transcode MP3 to Opus automatically
+    const stream = fs.createReadStream(audioPath);
+    console.log(`[Bot ${botNum}] File stream created`);
+    
+    const resource = createAudioResource(stream, { 
+      inputType: StreamType.Arbitrary,
+      inlineVolume: true
+    });
+    console.log(`[Bot ${botNum}] AudioResource created with StreamType.Arbitrary`);
 
     if (player) {
       player.play(resource);
+      console.log(`[Bot ${botNum}] player.play() called`);
     } else {
-      console.error(`[Bot ${botNum}] No player to play resource`);
+      console.error(`[Bot ${botNum}] No player available to play resource`);
     }
   };
 
   const startPlayback = () => {
     if (!connection) {
-      console.error(`[Bot ${botNum}] No connection`);
+      console.error(`[Bot ${botNum}] startPlayback: No connection`);
       return;
     }
+    const connStatus = connection.state?.status;
+    console.log(`[Bot ${botNum}] startPlayback: connection status = ${connStatus}`);
+    
     stopRequested = false;
     audioPlayCount = 0;
     setupPlayer();
@@ -295,16 +226,20 @@ tokens.forEach((token, index) => {
   };
 
   const stopPlayback = () => {
+    console.log(`[Bot ${botNum}] stopPlayback called`);
     stopRequested = true;
     audioPlayCount = 0;
-    killFfmpeg();
-    stopPlayer();
+    if (player) {
+      try { player.stop(true); } catch (e) {}
+      player.removeAllListeners();
+      player = null;
+    }
   };
 
   const safeDestroy = (conn) => {
     try {
       if (!conn) return;
-      const status = conn.state && conn.state.status;
+      const status = conn.state?.status;
       if (status && status !== VoiceConnectionStatus.Destroyed) {
         conn.destroy();
       }
@@ -320,6 +255,8 @@ tokens.forEach((token, index) => {
         connection = null;
       }
 
+      console.log(`[Bot ${botNum}] Joining voice channel ${vc.id} (attempt ${attempt})`);
+      
       connection = joinVoiceChannel({
         channelId: vc.id,
         guildId: guild.id,
@@ -374,13 +311,19 @@ tokens.forEach((token, index) => {
     .filter(id => id.length > 0);
 
   const handleBotCommand = async (commandName, reply, guild, member) => {
-    if (!guild || !member) return reply('Command failed: missing guild or member data.');
+    console.log(`[Bot ${botNum}] Command received: ${commandName}`);
+    
+    if (!guild || !member) {
+      console.log(`[Bot ${botNum}] Command failed: missing guild/member`);
+      return reply('Command failed: missing guild or member data.');
+    }
 
     const isAdmin = member.permissions.has('Administrator');
     const hasAllowedRole = allowedRoleIds.length > 0 &&
       allowedRoleIds.some(roleId => member.roles.cache.has(roleId));
 
     if (!isAdmin && !hasAllowedRole) {
+      console.log(`[Bot ${botNum}] Permission denied for ${commandName}`);
       if (allowedRoleIds.length === 0) {
         return reply('❌ You need **Administrator** permissions to use this command.');
       }
@@ -402,14 +345,28 @@ tokens.forEach((token, index) => {
     }
 
     if (commandName === 'bkst') {
-      if (!connection) return reply('Bot is not in a voice channel.');
-      if (!fs.existsSync(audioPath)) {
-        return reply(`Audio file not found for bot ${botNum}.`);
+      console.log(`[Bot ${botNum}] bkst command: checking connection...`);
+      if (!connection) {
+        console.log(`[Bot ${botNum}] bkst failed: no connection`);
+        return reply('Bot is not in a voice channel.');
       }
+      console.log(`[Bot ${botNum}] Connection status: ${connection.state?.status}`);
+      
+      console.log(`[Bot ${botNum}] bkst: checking audio file...`);
+      if (!fs.existsSync(audioPath)) {
+        console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
+        return reply(`Audio file ${botNum} not found.`);
+      }
+      console.log(`[Bot ${botNum}] Audio file OK: ${audioPath}`);
+
       const startAt = getSharedChstStartTime();
       const delay = Math.max(100, startAt - Date.now());
+      console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
       setTimeout(() => {
-        try { startPlayback(); } catch (err) {
+        console.log(`[Bot ${botNum}] Starting playback now...`);
+        try { 
+          startPlayback(); 
+        } catch (err) {
           console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
         }
       }, delay);
@@ -430,8 +387,8 @@ tokens.forEach((token, index) => {
 
     if (commandName === 'status') {
       try {
-        const connState = connection ? (connection.state && connection.state.status) : 'not connected';
-        const playerState = player ? (player.state && player.state.status) : 'no player';
+        const connState = connection ? (connection.state?.status) : 'not connected';
+        const playerState = player ? (player.state?.status) : 'no player';
         const msg = `Connection: ${connState}\nPlayer: ${playerState}`;
         await reply(msg);
       } catch (e) {
@@ -451,6 +408,8 @@ tokens.forEach((token, index) => {
     const content = message.content.trim().toLowerCase();
     if (!['!bkva', '!bkst', '!bksp', '!bklv', '!status'].includes(content)) return;
 
+    console.log(`[Bot ${botNum}] Message received: "${content}" from ${message.author.username}`);
+
     const reply = async text => {
       if (botNum !== 1) return;
       try {
@@ -465,13 +424,13 @@ tokens.forEach((token, index) => {
     console.log(`[Bot ${botNum}] Online ✅`);
 
     try {
-      if (client.application && client.application.commands && typeof client.application.commands.set === 'function') {
+      if (client.application?.commands && typeof client.application.commands.set === 'function') {
         await client.application.commands.set(slashCommands);
         console.log(`[Bot ${botNum}] Registered global slash commands`);
       } else {
         const guilds = await client.guilds.fetch();
         for (const [guildId, guild] of guilds) {
-          if (guild && guild.commands && typeof guild.commands.set === 'function') {
+          if (guild?.commands && typeof guild.commands.set === 'function') {
             await guild.commands.set(slashCommands);
           }
         }
@@ -490,6 +449,7 @@ tokens.forEach((token, index) => {
           if (!targetChannel || !targetChannel.isVoiceBased && !targetChannel.isStageBased) {
             console.warn(`[Bot ${botNum}] AUTO_JOIN: channel ${envChannel} not found or not a voice channel`);
           } else {
+            console.log(`[Bot ${botNum}] AUTO_JOIN: joining channel ${envChannel}`);
             connection = joinVoiceChannel({
               channelId: targetChannel.id,
               guildId: targetChannel.guild.id,
@@ -519,6 +479,8 @@ tokens.forEach((token, index) => {
   client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.user.bot) return;
+
+    console.log(`[Bot ${botNum}] Slash command received: /${interaction.commandName} from ${interaction.user.username}`);
 
     const reply = async (content) => {
       if (interaction.replied || interaction.deferred) {
