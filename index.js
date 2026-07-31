@@ -17,9 +17,9 @@ const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
-const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 200;
-const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 5;
-const PCM_CONVERT_CONCURRENCY = parseInt(process.env.PCM_CONVERT_CONCURRENCY, 10) || 3;
+const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 30;   // ⚡ fast stagger
+const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 10; // ⚡ more parallel joins
+const PCM_CONVERT_CONCURRENCY = parseInt(process.env.PCM_CONVERT_CONCURRENCY, 10) || 5;
 const joinQueue = [];
 const activeJoinTasks = new Set();
 let joinQueueProcessing = false;
@@ -52,9 +52,28 @@ const enqueueJoinTask = (task) => {
   }
 };
 
+// Heavy Saturation & Boost filter chain
+// Stage 1: volume=25dB   — drive input hard into saturation
+// Stage 2: acrusher      — crunchy saturation / distortion ("erachal" effect)
+// Stage 3: treble        — high-frequency bite
+// Stage 4: volume=10dB   — extra boost
+// Stage 5: alimiter      — cap peaks at 0.99 so audio NEVER overflows into silence
+const DISTORTION_FILTER = [
+  'volume=25dB',
+  'acrusher=level_in=1:level_out=1:bits=8:mode=log:aa=1',
+  'treble=g=12:f=4000',
+  'volume=10dB',
+  'alimiter=limit=0.99:level=true'
+].join(',');
+
 const convertAudioFile = async (inputPath, outputPath) => {
   return new Promise((resolve, reject) => {
-    const conv = spawn(ffmpegPath, ['-y', '-i', inputPath, '-ar', '48000', '-ac', '2', '-f', 's16le', outputPath]);
+    const conv = spawn(ffmpegPath, [
+      '-y', '-i', inputPath,
+      '-af', DISTORTION_FILTER,
+      '-ar', '48000', '-ac', '2', '-f', 's16le',
+      outputPath
+    ]);
     conv.stderr.on('data', () => {});
     conv.on('error', err => reject(err));
     conv.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg convert failed with code ${code}`)));
@@ -63,9 +82,12 @@ const convertAudioFile = async (inputPath, outputPath) => {
 
 const ensurePcmFile = async (audioPath) => {
   const pcmPath = audioPath.replace(/\.mp3$/i, '.pcm');
+  // ✅ BUG FIX: just return existing boosted PCM — do NOT delete/reconvert every play!
+  // Startup preconvertMissingAudioFiles() already handles the one-time re-bake.
   if (fs.existsSync(pcmPath)) {
     return pcmPath;
   }
+  // Fallback: convert if somehow missing
   await convertAudioFile(audioPath, pcmPath);
   return pcmPath;
 };
@@ -85,7 +107,10 @@ const preconvertMissingAudioFiles = async () => {
       console.log(`[PCM] SKIP missing audio file ${file}`);
       return;
     }
-    if (fs.existsSync(pcmPath)) return;
+    // Always re-bake PCM with boosted volume
+    if (fs.existsSync(pcmPath)) {
+      try { fs.unlinkSync(pcmPath); } catch (e) {}
+    }
     try {
       await convertAudioFile(audioPath, pcmPath);
       console.log(`[PCM] Converted ${file}`);
@@ -173,10 +198,10 @@ tokens.forEach((token, index) => {
   });
 
   const slashCommands = [
-    { name: 'chva', description: 'Make the bot join your voice channel' },
-    { name: 'chst', description: 'Start audio playback (10x repeat)' },
-    { name: 'chsp', description: 'Stop audio playback' },
-    { name: 'chlv', description: 'Leave the voice channel' }
+    { name: 'bkva', description: 'Make the bot join your voice channel' },
+    { name: 'bkst', description: 'Start audio playback (10x repeat)' },
+    { name: 'bksp', description: 'Stop audio playback' },
+    { name: 'bklv', description: 'Leave the voice channel' }
   ];
 
   let connection;
@@ -215,7 +240,12 @@ tokens.forEach((token, index) => {
         resource = createAudioResource(stream, { inputType: StreamType.Raw, inlineVolume: true });
       } catch (err) {
         console.warn(`[Bot ${botNum}] PCM fallback to ffmpeg stream:`, err.message || err);
-        const ffmpegArgs = ['-i', audioPath, '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'];
+        // Same distortion chain applied in live stream fallback
+        const ffmpegArgs = [
+          '-i', audioPath,
+          '-af', DISTORTION_FILTER,
+          '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'
+        ];
         if (currentFfmpegProcess) {
           currentFfmpegProcess.kill();
           currentFfmpegProcess = null;
@@ -226,7 +256,7 @@ tokens.forEach((token, index) => {
         currentFfmpegProcess.on('error', err => console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message));
       }
 
-      if (resource.volume) resource.volume.setVolume(0.9);
+      if (resource.volume) resource.volume.setVolume(1.0);
 
       if (!player) {
         player = createAudioPlayer();
@@ -292,7 +322,7 @@ tokens.forEach((token, index) => {
         console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
       });
 
-      await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+      await entersState(connection, VoiceConnectionStatus.Ready, 10000); // ⚡ faster timeout
       console.log(`[Bot ${botNum}] JOINED ✅`);
       await reply('✅ Joined your voice channel.');
     } catch (err) {
@@ -313,15 +343,32 @@ tokens.forEach((token, index) => {
     }
   };
 
+  // Parse allowed role IDs from env (comma-separated)
+  const allowedRoleIds = (process.env.ALLOWED_ROLE_IDS || '')
+    .split(',')
+    .map(id => id.trim())
+    .filter(id => id.length > 0);
+
   const handleBotCommand = async (commandName, reply, guild, member) => {
     if (!guild || !member) return reply('Command failed: missing guild or member data.');
 
-    // Admin check
-    if (!member.permissions.has('Administrator')) {
-      return reply('❌ You need **Administrator** permissions to use this command.');
+    // Access check: allow Administrators OR members with at least one allowed role
+    const isAdmin = member.permissions.has('Administrator');
+    const hasAllowedRole = allowedRoleIds.length > 0 &&
+      allowedRoleIds.some(roleId => member.roles.cache.has(roleId));
+
+    if (!isAdmin && !hasAllowedRole) {
+      if (allowedRoleIds.length === 0) {
+        return reply('❌ You need **Administrator** permissions to use this command.');
+      }
+      // Build role mention list for a helpful error message
+      const roleMentions = allowedRoleIds
+        .map(id => `<@&${id}>`)
+        .join(', ');
+      return reply(`❌ You need **Administrator** permissions or one of these roles to use this command: ${roleMentions}`);
     }
 
-    if (commandName === 'chva') {
+    if (commandName === 'bkva') {
       if (isJoining) return reply('Already joining...');
 
       const vc = member.voice.channel;
@@ -335,7 +382,7 @@ tokens.forEach((token, index) => {
       return;
     }
 
-    if (commandName === 'chst') {
+    if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
       // Use bot-specific audio file (allow using pre-converted .pcm if .mp3 is missing)
@@ -355,7 +402,7 @@ tokens.forEach((token, index) => {
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED (Boosted Audio)');
     }
 
-    if (commandName === 'chsp') {
+    if (commandName === 'bksp') {
       stopRequested = true;
       audioPlayCount = 0;
       if (player) {
@@ -368,7 +415,7 @@ tokens.forEach((token, index) => {
       return reply('✅ Audio stopped.');
     }
 
-    if (commandName === 'chlv') {
+    if (commandName === 'bklv') {
       safeDestroy(connection);
       connection = null;
       return reply('✅ Left voice channel.');
@@ -399,7 +446,7 @@ ${msg}
   client.on('messageCreate', async message => {
     if (message.author.bot) return;
     const content = message.content.trim().toLowerCase();
-    if (!['!chva', '!chst', '!chsp', '!chlv', '!status'].includes(content)) return;
+    if (!['!bkva', '!bkst', '!bksp', '!bklv', '!status'].includes(content)) return;
 
     const reply = async text => {
       try {

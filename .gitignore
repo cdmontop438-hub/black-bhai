@@ -1,5 +1,5 @@
 node_modules/
 .env
-.env.local
-*.mp3
+.env.*
+*.pcm
 package-lock.json
