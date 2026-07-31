@@ -13,7 +13,7 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const { spawnSync } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
@@ -88,6 +88,38 @@ if (!tokens.length) {
 
 console.log(`Starting ${tokens.length} bots in NUCLEAR STACKED mode...`);
 
+// 🛠️ FIXED: Pre-convert all MP3 files to PCM at startup (synchronous, one-time)
+// This avoids real-time ffmpeg conversion which was too slow (0.5x speed)
+// PCM files are read directly from disk during playback — fast and reliable
+console.log('[PCM] Pre-converting MP3 files to PCM...');
+for (let i = 1; i <= 10; i++) {
+  const mp3Path = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${i}.mp3`);
+  const pcmPath = mp3Path.replace(/\.mp3$/i, '.pcm');
+  if (!fs.existsSync(mp3Path)) {
+    console.log(`[PCM] SKIP missing ${path.basename(mp3Path)}`);
+    continue;
+  }
+  if (fs.existsSync(pcmPath)) {
+    const stats = fs.statSync(pcmPath);
+    if (stats.size > 1024) {
+      console.log(`[PCM] EXISTS ${path.basename(pcmPath)} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+      continue;
+    }
+  }
+  console.log(`[PCM] Converting ${path.basename(mp3Path)} -> ${path.basename(pcmPath)}...`);
+  const result = spawnSync(ffmpegPath, [
+    '-y', '-i', mp3Path,
+    '-ar', '48000', '-ac', '2', '-f', 's16le', pcmPath
+  ], { stdio: 'pipe' });
+  if (result.status !== 0) {
+    console.error(`[PCM] FAILED to convert ${path.basename(mp3Path)}:`, result.stderr.toString().slice(-500));
+  } else {
+    const stats = fs.statSync(pcmPath);
+    console.log(`[PCM] OK ${path.basename(pcmPath)} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+  }
+}
+console.log('[PCM] Pre-conversion complete.');
+
 let sharedChstStartTime = 0;
 const getSharedChstStartTime = () => {
   if (sharedChstStartTime <= Date.now()) {
@@ -116,7 +148,6 @@ tokens.forEach((token, index) => {
 
   let connection;
   let player;
-  let currentFfmpegProcess = null;
   let stopRequested = false;
   let isJoining = false;
   let audioPlayCount = 0;
@@ -137,31 +168,20 @@ tokens.forEach((token, index) => {
     }
   };
 
-  const killFfmpeg = () => {
-    if (currentFfmpegProcess) {
-      currentFfmpegProcess.kill();
-      currentFfmpegProcess = null;
-    }
-  };
-
-  // 🛠️ FIXED: Use ffmpeg-static to convert MP3 → PCM → pipe to player with StreamType.Raw
-  // This is the most reliable approach because:
-  // 1. We control the ffmpeg binary directly (ffmpeg-static)
-  // 2. StreamType.Raw encodes PCM to Opus using the installed opus modules
-  // 3. No inlineVolume (can cause issues) — just pass raw PCM
+  // 🛠️ FIXED: Play pre-converted PCM files directly from disk
+  // No ffmpeg process needed during playback — avoids 0.5x speed bottleneck
   const startPlayback = async () => {
     if (!connection) {
       console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
       return;
     }
 
-    const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+    const pcmPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
 
     stopRequested = false;
     audioPlayCount = 0;
 
     cleanupPlayer();
-    killFfmpeg();
 
     const playOnce = async () => {
       if (stopRequested) return;
@@ -173,35 +193,9 @@ tokens.forEach((token, index) => {
       console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
 
       try {
-        // Convert MP3 to PCM via ffmpeg-static, pipe to player
-        const ffmpegArgs = [
-          '-i', audioPath,
-          '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'
-        ];
-        killFfmpeg();
-        currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
-        
-        // Create resource from ffmpeg stdout (raw PCM)
-        const resource = createAudioResource(currentFfmpegProcess.stdout, { inputType: StreamType.Raw });
-        
-        // Log ffmpeg errors only (not progress)
-        let ffmpegStderr = '';
-        currentFfmpegProcess.stderr.on('data', (chunk) => {
-          const text = chunk.toString();
-          ffmpegStderr += text;
-          // Only log if it's an error (not progress lines)
-          if (text.includes('Error') || text.includes('error') || text.includes('failed')) {
-            console.error(`[Bot ${botNum}] FFMPEG: ${text.trim()}`);
-          }
-        });
-        currentFfmpegProcess.on('error', err => {
-          console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message);
-        });
-        currentFfmpegProcess.on('exit', (code) => {
-          if (code !== 0 && code !== null) {
-            console.error(`[Bot ${botNum}] FFMPEG exited with code ${code}. Stderr:\n${ffmpegStderr.slice(-1000)}`);
-          }
-        });
+        // Read pre-converted PCM file directly from disk
+        const stream = fs.createReadStream(pcmPath, { highWaterMark: 128 * 1024 });
+        const resource = createAudioResource(stream, { inputType: StreamType.Raw });
 
         cleanupPlayer();
         player = createAudioPlayer();
@@ -234,7 +228,6 @@ tokens.forEach((token, index) => {
           console.warn(`[Bot ${botNum}] ⚠️ Playback timeout (${audioPlayCount}/${maxAudioPlays}) — resetting`);
           if (!stopRequested && audioPlayCount < maxAudioPlays) {
             cleanupPlayer();
-            killFfmpeg();
             setTimeout(() => {
               playOnce().catch(e => console.error(`[Bot ${botNum}] timeout recovery error:`, e?.message || e));
             }, 500);
@@ -294,12 +287,10 @@ tokens.forEach((token, index) => {
       connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
         cleanupPlayer();
-        killFfmpeg();
       });
       connection.on(VoiceConnectionStatus.Destroyed, () => {
         console.log(`[Bot ${botNum}] VOICE DESTROYED`);
         cleanupPlayer();
-        killFfmpeg();
       });
       connection.on('stateChange', (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
@@ -367,9 +358,9 @@ tokens.forEach((token, index) => {
     if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
-      if (!fs.existsSync(botAudio)) {
-        return reply(`BOOGEYMAN audio file ${botNum} not found.`);
+      const botPcm = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
+      if (!fs.existsSync(botPcm)) {
+        return reply(`BOOGEYMAN PCM file ${botNum} not found.`);
       }
 
       // Align start time across bots for synchronized playback
@@ -386,13 +377,11 @@ tokens.forEach((token, index) => {
       stopRequested = true;
       audioPlayCount = 0;
       cleanupPlayer();
-      killFfmpeg();
       return reply('✅ Audio stopped.');
     }
 
     if (commandName === 'bklv') {
       cleanupPlayer();
-      killFfmpeg();
       safeDestroy(connection);
       connection = null;
       return reply('✅ Left voice channel.');
@@ -403,8 +392,7 @@ tokens.forEach((token, index) => {
         const connState = connection ? (connection.state && connection.state.status) : 'not connected';
         const channelId = connection && connection.joinConfig ? connection.joinConfig.channelId : (connection && connection.joining ? connection.joining.channelId : 'none');
         const playerState = player ? (player.state && player.state.status) : 'no player';
-        const ffmpegRunning = currentFfmpegProcess ? true : false;
-        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}\nFFmpeg: ${ffmpegRunning}`;
+        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}`;
         await reply(`
 
 ${msg}
