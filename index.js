@@ -13,8 +13,6 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-const { spawn } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
 const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;
@@ -50,15 +48,6 @@ const enqueueJoinTask = (task) => {
     void processJoinQueue();
   }
 };
-
-// Moderate saturation & boost filter chain
-const DISTORTION_FILTER = [
-  'volume=10dB',
-  'acrusher=level_in=1:level_out=1:bits=12:mode=log:aa=1',
-  'treble=g=6:f=4000',
-  'volume=5dB',
-  'alimiter=limit=0.99:level=true'
-].join(',');
 
 require('opusscript');
 require('libsodium-wrappers');
@@ -125,15 +114,12 @@ tokens.forEach((token, index) => {
 
   let connection;
   let player;
-  let currentFfmpegProcess = null;
   let stopRequested = false;
   let isJoining = false;
   let audioPlayCount = 0;
   let maxAudioPlays = 10;
   let playbackTimeout = null;
 
-  // 🛠️ FIXED: Only clean up player and timeout — do NOT kill ffmpeg here
-  // (ffmpeg is killed separately to avoid cutting off the live stream)
   const cleanupPlayer = () => {
     if (playbackTimeout) {
       clearTimeout(playbackTimeout);
@@ -148,16 +134,9 @@ tokens.forEach((token, index) => {
     }
   };
 
-  const killFfmpeg = () => {
-    if (currentFfmpegProcess) {
-      currentFfmpegProcess.kill();
-      currentFfmpegProcess = null;
-    }
-  };
-
-  // 🛠️ FIXED: Use live ffmpeg streaming as the PRIMARY method
-  // Removed PCM pre-conversion which caused race conditions and corrupted files
-  // The ffmpeg live stream applies the distortion filter and pipes directly to the player
+  // 🛠️ FIXED: Use @discordjs/voice's native StreamType.Arbitrary
+  // This lets the library handle the audio conversion internally via its own ffmpeg pipeline
+  // No custom distortion filter — plays the original audio cleanly
   const startPlayback = async () => {
     if (!connection) {
       console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
@@ -169,9 +148,7 @@ tokens.forEach((token, index) => {
     stopRequested = false;
     audioPlayCount = 0;
 
-    // Clean up any existing player before starting fresh
     cleanupPlayer();
-    killFfmpeg();
 
     const playOnce = async () => {
       if (stopRequested) return;
@@ -180,79 +157,65 @@ tokens.forEach((token, index) => {
         return;
       }
       audioPlayCount++;
-      console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays}) -> ${audioPath}`);
+      console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
 
-      // 🛠️ FIXED: Always use live ffmpeg streaming with distortion filter
-      // This avoids file-based race conditions and PCM corruption issues
-      const ffmpegArgs = [
-        '-i', audioPath,
-        '-af', DISTORTION_FILTER,
-        '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'
-      ];
-      killFfmpeg();
-      currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
-      const resource = createAudioResource(currentFfmpegProcess.stdout, { inputType: StreamType.Raw, inlineVolume: true });
-      currentFfmpegProcess.stderr.on('data', chunk => {
-        const msg = chunk.toString().trim();
-        if (msg) console.error(`[Bot ${botNum}] FFMPEG: ${msg}`);
-      });
-      currentFfmpegProcess.on('error', err => console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message));
-      // If ffmpeg exits unexpectedly, try next play
-      currentFfmpegProcess.on('exit', (code) => {
-        if (code !== 0 && code !== null) {
-          console.warn(`[Bot ${botNum}] FFMPEG exited with code ${code}`);
-        }
-      });
+      try {
+        // 🛠️ FIXED: Use native StreamType.Arbitrary — library handles conversion internally
+        // No custom ffmpeg process, no distortion filter, no PCM conversion
+        // This is the most reliable approach for @discordjs/voice
+        const stream = fs.createReadStream(audioPath, { highWaterMark: 128 * 1024 });
+        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
 
-      if (resource.volume) resource.volume.setVolume(1.0);
+        if (resource.volume) resource.volume.setVolume(1.0);
 
-      // 🛠️ FIXED: Create fresh player — do NOT call cleanupPlayer() here
-      // (it would kill the ffmpeg process we just started!)
-      cleanupPlayer();
-      player = createAudioPlayer();
-      player.on('error', err => {
-        console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message);
+        cleanupPlayer();
+        player = createAudioPlayer();
+        player.on('error', err => {
+          console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message);
+          if (!stopRequested && audioPlayCount < maxAudioPlays) {
+            setTimeout(() => {
+              playOnce().catch(e => console.error(`[Bot ${botNum}] playOnce recovery error:`, e?.message || e));
+            }, 500);
+          }
+        });
+        player.on('stateChange', (o, n) => {
+          console.log(`[Bot ${botNum}] PLAYER STATE: ${o.status} -> ${n.status}`);
+          if (n.status === AudioPlayerStatus.Idle && !stopRequested && audioPlayCount < maxAudioPlays) {
+            if (o.status === AudioPlayerStatus.Buffering) {
+              console.warn(`[Bot ${botNum}] ⚠️ Stream ended before playing — retrying...`);
+              setTimeout(() => {
+                playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce retry error:`, err?.message || err));
+              }, 200);
+            } else {
+              setTimeout(() => {
+                playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err));
+              }, 100);
+            }
+          }
+        });
+
+        if (playbackTimeout) clearTimeout(playbackTimeout);
+        playbackTimeout = setTimeout(() => {
+          console.warn(`[Bot ${botNum}] ⚠️ Playback timeout (${audioPlayCount}/${maxAudioPlays}) — resetting`);
+          if (!stopRequested && audioPlayCount < maxAudioPlays) {
+            cleanupPlayer();
+            setTimeout(() => {
+              playOnce().catch(e => console.error(`[Bot ${botNum}] timeout recovery error:`, e?.message || e));
+            }, 500);
+          }
+        }, 60000);
+
+        player.play(resource);
+        const subscription = connection.subscribe(player);
+        if (!subscription) console.error(`[Bot ${botNum}] FAILED TO SUBSCRIBE AUDIO PLAYER`);
+      } catch (err) {
+        console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err);
         if (!stopRequested && audioPlayCount < maxAudioPlays) {
           setTimeout(() => {
             playOnce().catch(e => console.error(`[Bot ${botNum}] playOnce recovery error:`, e?.message || e));
           }, 500);
         }
-      });
-      player.on('stateChange', (o, n) => {
-        console.log(`[Bot ${botNum}] PLAYER STATE: ${o.status} -> ${n.status}`);
-        // 🛠️ FIXED: Only advance to next play when audio actually finishes playing
-        if (n.status === AudioPlayerStatus.Idle && !stopRequested && audioPlayCount < maxAudioPlays) {
-          // If we never reached playing state, the stream was empty — retry with delay
-          if (o.status === AudioPlayerStatus.Buffering) {
-            console.warn(`[Bot ${botNum}] ⚠️ Stream ended before playing (empty resource) — retrying...`);
-            setTimeout(() => {
-              playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce retry error:`, err?.message || err));
-            }, 200);
-          } else {
-            // Normal completion — advance to next play
-            setTimeout(() => {
-              playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err));
-            }, 100);
-          }
-        }
-      });
-
-      // 🛠️ FIXED: 60-second timeout per track (audio files are long)
-      if (playbackTimeout) clearTimeout(playbackTimeout);
-      playbackTimeout = setTimeout(() => {
-        console.warn(`[Bot ${botNum}] ⚠️ Playback timeout (${audioPlayCount}/${maxAudioPlays}) — resetting`);
-        if (!stopRequested && audioPlayCount < maxAudioPlays) {
-          cleanupPlayer();
-          killFfmpeg();
-          setTimeout(() => {
-            playOnce().catch(e => console.error(`[Bot ${botNum}] timeout recovery error:`, e?.message || e));
-          }, 500);
-        }
-      }, 60000);
-
-      player.play(resource);
-      const subscription = connection.subscribe(player);
-      if (!subscription) console.error(`[Bot ${botNum}] FAILED TO SUBSCRIBE AUDIO PLAYER`);
+      }
     };
 
     await playOnce();
@@ -295,12 +258,10 @@ tokens.forEach((token, index) => {
       connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
         cleanupPlayer();
-        killFfmpeg();
       });
       connection.on(VoiceConnectionStatus.Destroyed, () => {
         console.log(`[Bot ${botNum}] VOICE DESTROYED`);
         cleanupPlayer();
-        killFfmpeg();
       });
       connection.on('stateChange', (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
@@ -380,20 +341,18 @@ tokens.forEach((token, index) => {
         startPlayback().catch(err => console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err));
       }, delay);
 
-      return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED (Boosted Audio)');
+      return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
 
     if (commandName === 'bksp') {
       stopRequested = true;
       audioPlayCount = 0;
       cleanupPlayer();
-      killFfmpeg();
       return reply('✅ Audio stopped.');
     }
 
     if (commandName === 'bklv') {
       cleanupPlayer();
-      killFfmpeg();
       safeDestroy(connection);
       connection = null;
       return reply('✅ Left voice channel.');
@@ -404,8 +363,7 @@ tokens.forEach((token, index) => {
         const connState = connection ? (connection.state && connection.state.status) : 'not connected';
         const channelId = connection && connection.joinConfig ? connection.joinConfig.channelId : (connection && connection.joining ? connection.joining.channelId : 'none');
         const playerState = player ? (player.state && player.state.status) : 'no player';
-        const ffmpegRunning = currentFfmpegProcess ? true : false;
-        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}\nFFmpeg running: ${ffmpegRunning}`;
+        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}`;
         await reply(`
 
 ${msg}
