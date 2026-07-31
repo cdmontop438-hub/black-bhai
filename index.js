@@ -127,102 +127,66 @@ tokens.forEach((token, index) => {
   let maxAudioPlays = 10;
   let playbackTimeout = null;
 
-  const cleanupPlayer = () => {
-    if (playbackTimeout) {
-      clearTimeout(playbackTimeout);
-      playbackTimeout = null;
-    }
+  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+
+  // 🛠️ FIXED: Setup player once with event listeners
+  // subscribe() is called BEFORE play() — correct order
+  // Error retries after 1 second, Idle creates fresh resource and loops
+  const setupPlayer = () => {
     if (player) {
-      try {
-        player.stop(true);
-      } catch (e) {}
+      try { player.stop(true); } catch (e) {}
       player.removeAllListeners();
-      player = null;
+    }
+    player = createAudioPlayer();
+    player.on('error', err => {
+      console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message);
+      if (!stopRequested) {
+        setTimeout(() => playTrack(), 1000);
+      }
+    });
+    player.on('stateChange', (o, n) => {
+      console.log(`[Bot ${botNum}] PLAYER STATE: ${o.status} -> ${n.status}`);
+      if (n.status === AudioPlayerStatus.Idle && !stopRequested) {
+        // 🛠️ FIXED: Always create fresh resource on Idle and replay
+        setTimeout(() => playTrack(), 100);
+      }
+    });
+    // Subscribe BEFORE playing — critical for audio to reach Discord
+    connection.subscribe(player);
+  };
+
+  // 🛠️ FIXED: Creates a fresh resource each time, then plays it on the existing player
+  const playTrack = () => {
+    if (stopRequested) return;
+    if (audioPlayCount >= maxAudioPlays) {
+      console.log(`[Bot ${botNum}] 🔥 BOOGEYMAN COMPLETE - ${maxAudioPlays} plays finished`);
+      return;
+    }
+    audioPlayCount++;
+    console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
+
+    try {
+      // Create a FRESH resource every time — old resource becomes unreadable after one play
+      const stream = fs.createReadStream(audioPath);
+      const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+      player.play(resource);
+    } catch (err) {
+      console.error(`[Bot ${botNum}] playTrack error:`, err?.message || err);
+      if (!stopRequested) {
+        setTimeout(() => playTrack(), 1000);
+      }
     }
   };
 
-  // 🛠️ FIXED: Use createAudioResource with StreamType.Arbitrary on a fresh stream
-  // The library internally spawns ffmpeg to convert MP3 → Opus
-  // No demuxProbe (which consumed the stream header), no ffmpeg-static, no PCM
-  const startPlayback = async () => {
+  const startPlayback = () => {
     if (!connection) {
       console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
       return;
     }
-
-    const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
-
     stopRequested = false;
     audioPlayCount = 0;
-
-    cleanupPlayer();
-
-    const playOnce = async () => {
-      if (stopRequested) return;
-      if (audioPlayCount >= maxAudioPlays) {
-        console.log(`[Bot ${botNum}] 🔥 BOOGEYMAN COMPLETE - ${maxAudioPlays} plays finished`);
-        return;
-      }
-      audioPlayCount++;
-      console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
-
-      try {
-        // Create a fresh stream for each play — StreamType.Arbitrary lets the library
-        // handle the MP3 → Opus conversion internally via its own ffmpeg pipeline
-        const stream = fs.createReadStream(audioPath);
-        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
-
-        cleanupPlayer();
-        player = createAudioPlayer();
-        player.on('error', err => {
-          console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message);
-          if (!stopRequested && audioPlayCount < maxAudioPlays) {
-            setTimeout(() => {
-              playOnce().catch(e => console.error(`[Bot ${botNum}] playOnce recovery error:`, e?.message || e));
-            }, 500);
-          }
-        });
-        player.on('stateChange', (o, n) => {
-          console.log(`[Bot ${botNum}] PLAYER STATE: ${o.status} -> ${n.status}`);
-          if (n.status === AudioPlayerStatus.Idle && !stopRequested && audioPlayCount < maxAudioPlays) {
-            if (o.status === AudioPlayerStatus.Buffering) {
-              console.warn(`[Bot ${botNum}] ⚠️ Stream ended before playing — retrying...`);
-              setTimeout(() => {
-                playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce retry error:`, err?.message || err));
-              }, 200);
-            } else {
-              setTimeout(() => {
-                playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err));
-              }, 100);
-            }
-          }
-        });
-
-        if (playbackTimeout) clearTimeout(playbackTimeout);
-        playbackTimeout = setTimeout(() => {
-          console.warn(`[Bot ${botNum}] ⚠️ Playback timeout (${audioPlayCount}/${maxAudioPlays}) — resetting`);
-          if (!stopRequested && audioPlayCount < maxAudioPlays) {
-            cleanupPlayer();
-            setTimeout(() => {
-              playOnce().catch(e => console.error(`[Bot ${botNum}] timeout recovery error:`, e?.message || e));
-            }, 500);
-          }
-        }, 60000);
-
-        player.play(resource);
-        const subscription = connection.subscribe(player);
-        if (!subscription) console.error(`[Bot ${botNum}] FAILED TO SUBSCRIBE AUDIO PLAYER`);
-      } catch (err) {
-        console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err);
-        if (!stopRequested && audioPlayCount < maxAudioPlays) {
-          setTimeout(() => {
-            playOnce().catch(e => console.error(`[Bot ${botNum}] playOnce recovery error:`, e?.message || e));
-          }, 500);
-        }
-      }
-    };
-
-    await playOnce();
+    setupPlayer();
+    playTrack();
   };
 
   const safeDestroy = (conn) => {
@@ -261,11 +225,21 @@ tokens.forEach((token, index) => {
       });
       connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
-        cleanupPlayer();
+        stopRequested = true;
+        if (player) {
+          try { player.stop(true); } catch (e) {}
+          player.removeAllListeners();
+          player = null;
+        }
       });
       connection.on(VoiceConnectionStatus.Destroyed, () => {
         console.log(`[Bot ${botNum}] VOICE DESTROYED`);
-        cleanupPlayer();
+        stopRequested = true;
+        if (player) {
+          try { player.stop(true); } catch (e) {}
+          player.removeAllListeners();
+          player = null;
+        }
       });
       connection.on('stateChange', (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
@@ -342,7 +316,9 @@ tokens.forEach((token, index) => {
       const startAt = getSharedChstStartTime();
       const delay = Math.max(100, startAt - Date.now());
       setTimeout(() => {
-        startPlayback().catch(err => console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err));
+        try { startPlayback(); } catch (err) {
+          console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
+        }
       }, delay);
 
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
@@ -351,12 +327,21 @@ tokens.forEach((token, index) => {
     if (commandName === 'bksp') {
       stopRequested = true;
       audioPlayCount = 0;
-      cleanupPlayer();
+      if (player) {
+        try { player.stop(true); } catch (e) {}
+        player.removeAllListeners();
+        player = null;
+      }
       return reply('✅ Audio stopped.');
     }
 
     if (commandName === 'bklv') {
-      cleanupPlayer();
+      stopRequested = true;
+      if (player) {
+        try { player.stop(true); } catch (e) {}
+        player.removeAllListeners();
+        player = null;
+      }
       safeDestroy(connection);
       connection = null;
       return reply('✅ Left voice channel.');
@@ -443,7 +428,7 @@ ${msg}
             try {
               await entersState(connection, VoiceConnectionStatus.Ready, 15000);
               console.log(`[Bot ${botNum}] AUTO VOICE READY`);
-              await startPlayback();
+              startPlayback();
             } catch (err) {
               console.error(`[Bot ${botNum}] AUTO startPlayback failed:`, err?.message || err);
             }
