@@ -174,9 +174,14 @@ tokens.forEach((token, index) => {
       '-ar', '48000',
       '-ac', '2',
       '-f', 'ogg',
+      '-flush_packets', '1',
+      '-fflags', '+nobuffer+fastseek+flush_packets',
+      '-flags', '+global_header',
+      '-avoid_negative_ts', 'make_zero',
       'pipe:1'
     ], {
-      stdio: ['pipe', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true
     });
 
     currentFfmpeg = ffmpeg;
