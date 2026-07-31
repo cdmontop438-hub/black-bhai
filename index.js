@@ -410,7 +410,7 @@ tokens.forEach((token, index) => {
     audioPlayCount++;
     console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
 
-    // If we have a preloaded resource, use it
+    // Priority 1: Use preloaded resource (from bot ready event)
     if (usePreloaded && preloadedResource && preloadedFfmpeg && !preloadedFfmpeg.killed) {
       const resource = preloadedResource;
       currentFfmpeg = preloadedFfmpeg;
@@ -425,35 +425,36 @@ tokens.forEach((token, index) => {
       return;
     }
 
-    // For repeats, spawn ffmpeg ahead of time to avoid buffering
-    if (audioPlayCount > 0 && !currentFfmpeg) {
-      console.log(`[Bot ${botNum}] Pre-spawning ffmpeg for next repeat...`);
-      const ffmpeg = spawnFfmpeg();
-      if (ffmpeg) {
-        currentFfmpeg = ffmpeg;
-        // Give ffmpeg 300ms to start buffering before we create resource
-        setTimeout(() => {
-          if (!stopRequested && audioPlayCount < maxAudioPlays) {
-            playTrack();
-          }
-        }, 300);
+    // Priority 2: Use current ffmpeg (pre-spawned by bkst command or previous playTrack)
+    if (currentFfmpeg && !currentFfmpeg.killed) {
+      const resource = createOptimizedResource();
+      if (resource) {
+        if (player) {
+          player.play(resource);
+        } else {
+          console.error(`[Bot ${botNum}] No player available`);
+        }
         return;
       }
     }
 
-    const resource = createOptimizedResource();
-    if (!resource) {
-      if (!stopRequested) {
-        setTimeout(() => playTrack(), 1000);
-      }
+    // Priority 3: Spawn new ffmpeg if nothing available
+    console.log(`[Bot ${botNum}] Spawning new ffmpeg...`);
+    const ffmpeg = spawnFfmpeg();
+    if (!ffmpeg) {
+      console.error(`[Bot ${botNum}] Failed to spawn ffmpeg`);
+      setTimeout(() => playTrack(), 1000);
       return;
     }
 
-    if (player) {
-      player.play(resource);
-    } else {
-      console.error(`[Bot ${botNum}] No player available`);
-    }
+    currentFfmpeg = ffmpeg;
+    
+    // Wait a bit for ffmpeg to buffer, then create resource
+    setTimeout(() => {
+      if (!stopRequested) {
+        playTrack();
+      }
+    }, 500);
   };
 
   const startPlayback = () => {
@@ -645,8 +646,8 @@ tokens.forEach((token, index) => {
       const delay = Math.max(100, startAt - Date.now());
       console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
 
-      // Spawn ffmpeg IMMEDIATELY so it's ready when scheduled
-      console.log(`[Bot ${botNum}] Starting ffmpeg immediately...`);
+      // Spawn ffmpeg immediately
+      console.log(`[Bot ${botNum}] Starting ffmpeg...`);
       const ffmpeg = spawnFfmpeg();
       if (!ffmpeg) {
         return reply('❌ Failed to start audio processor.');
@@ -654,29 +655,27 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Wait for ffmpeg to buffer enough data, then create resource and schedule
-      setTimeout(() => {
-        console.log(`[Bot ${botNum}] Creating audio resource...`);
-        try {
-          const resource = createAudioResource(ffmpeg.stdout, {
-            inputType: StreamType.OggOpus,
-            inlineVolume: true
-          });
-          currentResource = resource;
-          
-          // Schedule playback at the synchronized time
-          setTimeout(() => {
-            console.log(`[Bot ${botNum}] Starting playback now...`);
-            try {
-              startPlaybackWithResource(resource);
-            } catch (err) {
-              console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
-            }
-          }, Math.max(0, delay));
-        } catch (err) {
-          console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
-        }
-      }, 500); // Wait 500ms for ffmpeg to buffer
+      // Create resource immediately - the audio player will buffer automatically
+      try {
+        const resource = createAudioResource(ffmpeg.stdout, {
+          inputType: StreamType.OggOpus,
+          inlineVolume: true
+        });
+        currentResource = resource;
+        
+        // Schedule playback at synchronized time
+        setTimeout(() => {
+          console.log(`[Bot ${botNum}] Starting playback now...`);
+          try {
+            startPlaybackWithResource(resource);
+          } catch (err) {
+            console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
+          }
+        }, delay);
+      } catch (err) {
+        console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
+        return reply('❌ Failed to create audio resource.');
+      }
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
