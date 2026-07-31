@@ -7,13 +7,19 @@ const {
   AudioPlayerStatus,
   entersState,
   VoiceConnectionStatus,
-  StreamType,
-  demuxProbe
+  StreamType
 } = require('@discordjs/voice');
 
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const ffmpegPath = require('ffmpeg-static');
+
+// 🛠️ FIXED: Tell prism-media (used internally by @discordjs/voice) where to find ffmpeg
+// Without this, StreamType.Arbitrary conversion may fail silently on Render
+if (ffmpegPath) {
+  process.env.FFMPEG_PATH = ffmpegPath;
+}
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
 const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;
@@ -135,8 +141,9 @@ tokens.forEach((token, index) => {
     }
   };
 
-  // 🛠️ FIXED: Use @discordjs/voice's built-in demuxProbe to play MP3 files natively
-  // No ffmpeg piping, no PCM conversion, no huge files — just clean MP3 playback
+  // 🛠️ FIXED: Use createAudioResource with StreamType.Arbitrary on a fresh stream
+  // The library internally spawns ffmpeg to convert MP3 → Opus
+  // No demuxProbe (which consumed the stream header), no ffmpeg-static, no PCM
   const startPlayback = async () => {
     if (!connection) {
       console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
@@ -160,11 +167,10 @@ tokens.forEach((token, index) => {
       console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
 
       try {
-        // 🛠️ FIXED: Use demuxProbe to detect audio format and create proper resource
-        // This is the recommended approach from @discordjs/voice documentation
+        // Create a fresh stream for each play — StreamType.Arbitrary lets the library
+        // handle the MP3 → Opus conversion internally via its own ffmpeg pipeline
         const stream = fs.createReadStream(audioPath);
-        const probe = await demuxProbe(stream);
-        const resource = createAudioResource(probe.stream, { inputType: probe.type });
+        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
 
         cleanupPlayer();
         player = createAudioPlayer();
