@@ -127,7 +127,8 @@ tokens.forEach((token, index) => {
   let maxAudioPlays = 10;
   let playbackTimeout = null;
 
-  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+  // FIXED: Use PCM format for reliable playback - discord.js handles raw PCM natively
+  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
 
   // 🛠️ FIXED: Setup player once with event listeners
   // subscribe() is called BEFORE play() — correct order
@@ -174,8 +175,8 @@ tokens.forEach((token, index) => {
       
       // Create a FRESH resource every time — old resource becomes unreadable after one play
       const stream = fs.createReadStream(audioPath);
-      // FIXED: Use StreamType.Unknown for MP3 files - discord.js will auto-detect and transcode via ffmpeg
-      const resource = createAudioResource(stream, { inputType: StreamType.Unknown });
+      // FIXED: Let discord.js auto-detect the format - works for MP3 and other formats
+      const resource = createAudioResource(stream);
       player.play(resource);
     } catch (err) {
       console.error(`[Bot ${botNum}] playTrack error:`, err?.message || err);
@@ -314,9 +315,9 @@ tokens.forEach((token, index) => {
     if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
       if (!fs.existsSync(botAudio)) {
-        return reply(`BOOGEYMAN audio file ${botNum} not found.`);
+        return reply(`BOOGEYMAN PCM audio file ${botNum} not found.`);
       }
 
       // Align start time across bots for synchronized playback
