@@ -646,35 +646,31 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Wait for ffmpeg to produce sufficient data, then create resource
-      setTimeout(() => {
-        console.log(`[Bot ${botNum}] Creating audio resource...`);
-        let resource;
-        try {
-          resource = createAudioResource(ffmpeg.stdout, {
-            inputType: StreamType.OggOpus,
-            inlineVolume: true
-          });
-        } catch (err) {
-          console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
-          return;
-        }
+      // Create resource immediately - the audio player will buffer automatically
+      let resource;
+      try {
+        resource = createAudioResource(ffmpeg.stdout, {
+          inputType: StreamType.OggOpus,
+          inlineVolume: true
+        });
+      } catch (err) {
+        console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
+        return reply('❌ Failed to create audio resource.');
+      }
 
-        // Give audio player time to buffer before starting playback
-        setTimeout(() => {
-          console.log(`[Bot ${botNum}] Starting playback...`);
-          try {
-            stopRequested = false;
-            audioPlayCount = 0;
-            setupPlayer();
-            player.play(resource);
-            console.log(`[Bot ${botNum}] Playback started ✅`);
-          } catch (err) {
-            console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
-          }
-        }, 1000); // Buffer for 1000ms before playing
-        
-      }, 2500); // Wait 2500ms for ffmpeg to produce initial data
+      // Start playback at synchronized time
+      setTimeout(() => {
+        console.log(`[Bot ${botNum}] Starting playback...`);
+        try {
+          stopRequested = false;
+          audioPlayCount = 0;
+          setupPlayer();
+          player.play(resource);
+          console.log(`[Bot ${botNum}] Playback started ✅`);
+        } catch (err) {
+          console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
+        }
+      }, delay);
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
