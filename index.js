@@ -166,21 +166,34 @@ tokens.forEach((token, index) => {
       const timer = setTimeout(() => {
         reject(new Error('FFmpeg ready timeout'));
       }, timeout);
-      // Check if ffmpeg is producing data by monitoring stderr for encoding start
-      ffmpeg.stderr.once('data', () => {
-        clearTimeout(timer);
-        resolve();
-      });
+      
+      let dataReceived = false;
+      
+      // Wait for actual audio data on stdout
+      const onData = () => {
+        if (!dataReceived) {
+          dataReceived = true;
+          clearTimeout(timer);
+          resolve();
+          ffmpeg.stdout.removeListener('data', onData);
+        }
+      };
+      
+      ffmpeg.stdout.once('data', onData);
       ffmpeg.on('error', (err) => {
         clearTimeout(timer);
         reject(err);
       });
-      // Also resolve after a short delay to give ffmpeg time to start
+      
+      // Fallback: resolve after 1.5s to avoid hanging
       setTimeout(() => {
-        if (!timer) return; // Already resolved/rejected
+        if (!dataReceived && !timer) return;
         clearTimeout(timer);
+        if (!dataReceived) {
+          ffmpeg.stdout.removeListener('data', onData);
+        }
         resolve();
-      }, 1000);
+      }, 1500);
     });
   };
 
