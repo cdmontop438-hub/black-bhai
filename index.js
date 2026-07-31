@@ -13,6 +13,7 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 // 🛠️ FIXED: Tell prism-media (used internally by @discordjs/voice) where to find ffmpeg
@@ -127,8 +128,8 @@ tokens.forEach((token, index) => {
   let maxAudioPlays = 10;
   let playbackTimeout = null;
 
-  // FIXED: Use PCM format with StreamType.Raw for direct playback without transcoding
-  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
+  // FIXED: Use MP3 with auto-detection - discord.js/prism-media will handle transcoding via ffmpeg
+  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
 
   // 🛠️ FIXED: Setup player once with event listeners
   // subscribe() is called BEFORE play() — correct order
@@ -173,15 +174,11 @@ tokens.forEach((token, index) => {
         return;
       }
       
-      // Create a FRESH resource every time — old resource becomes unreadable after one play
+      // FIXED: Use StreamType.Arbitrary for MP3 - prism-media will use ffmpeg to transcode
       const stream = fs.createReadStream(audioPath);
-      // FIXED: Use StreamType.Raw for PCM files with explicit format metadata
-      // Discord requires 48kHz, 2 channels, 16-bit signed little-endian PCM
       const resource = createAudioResource(stream, { 
-        inputType: StreamType.Raw,
-        inlineVolume: true,
-        sampleRate: 48000,
-        channelCount: 2
+        inputType: StreamType.Arbitrary,
+        inlineVolume: true
       });
       player.play(resource);
     } catch (err) {
@@ -321,9 +318,9 @@ tokens.forEach((token, index) => {
     if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
+      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
       if (!fs.existsSync(botAudio)) {
-        return reply(`BOOGEYMAN PCM audio file ${botNum} not found.`);
+        return reply(`BOOGEYMAN audio file ${botNum} not found.`);
       }
 
       // Align start time across bots for synchronized playback
