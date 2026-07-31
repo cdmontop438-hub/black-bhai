@@ -130,6 +130,8 @@ tokens.forEach((token, index) => {
   let maxAudioPlays = 10;
   let currentFfmpeg = null;
   let currentResource = null;
+  let preloadedFfmpeg = null;
+  let preloadedResource = null;
 
   // Use the new compressed audio file for all bots
   const audioPath = path.join(__dirname, 'V.2 DARK BOOGEYMAN 4LUVONTOP (1)_compressed.mp3');
@@ -137,36 +139,86 @@ tokens.forEach((token, index) => {
   // ========== AUDIO SYSTEM ==========
   
   // Kill any running ffmpeg process
-  const killFfmpeg = () => {
-    if (currentFfmpeg) {
-      try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
-      currentFfmpeg = null;
+  const killFfmpeg = (ffmpeg = currentFfmpeg) => {
+    if (ffmpeg) {
+      try { ffmpeg.kill('SIGKILL'); } catch (e) {}
     }
   };
 
-  // Create an optimized audio resource using ffmpeg
-  // Decodes MP3 → encodes to Opus directly in a single process
+  // Pre-load audio for instant playback
+  const preloadAudio = async () => {
+    if (!fs.existsSync(audioPath)) {
+      console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
+      return false;
+    }
+
+    try {
+      console.log(`[Bot ${botNum}] Pre-loading audio...`);
+      const ffmpeg = spawn(ffmpegPath, [
+        '-i', audioPath,
+        '-c:a', 'libopus',
+        '-b:a', '128k',
+        '-ar', '48000',
+        '-ac', '2',
+        '-f', 'ogg',
+        '-flush_packets', '1',
+        '-fflags', '+nobuffer+fastseek+flush_packets',
+        '-flags', '+global_header',
+        '-avoid_negative_ts', 'make_zero',
+        'pipe:1'
+      ], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true
+      });
+
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Preload timeout'));
+        }, 5000);
+
+        ffmpeg.stdout.once('data', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+
+        ffmpeg.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+      });
+
+      const resource = createAudioResource(ffmpeg.stdout, {
+        inputType: StreamType.OggOpus,
+        inlineVolume: true
+      });
+
+      preloadedFfmpeg = ffmpeg;
+      preloadedResource = resource;
+      console.log(`[Bot ${botNum}] Audio pre-loaded ✅`);
+      return true;
+    } catch (err) {
+      console.error(`[Bot ${botNum}] Preload failed:`, err.message);
+      return false;
+    }
+  };
+
   const createOptimizedResource = () => {
     if (!fs.existsSync(audioPath)) {
       console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
       return null;
     }
 
+    if (preloadedResource && preloadedFfmpeg) {
+      const resource = preloadedResource;
+      currentFfmpeg = preloadedFfmpeg;
+      currentResource = resource;
+      preloadedFfmpeg = null;
+      preloadedResource = null;
+      return resource;
+    }
+
     killFfmpeg();
 
-    console.log(`[Bot ${botNum}] Starting ffmpeg...`);
-
-    // FIXED: Use only standard ffmpeg options that are guaranteed to work
-    // across all ffmpeg-static builds.
-    //
-    // Removed non-standard options that caused errors:
-    // - '-apply_fec'     → Unrecognized option (libopus AVOption, not ffmpeg option)
-    // - '-frame_duration' → May not be available on all builds
-    // - '-application'    → May not be available on all builds
-    // - '-compression_level' → May not be available on all builds
-    // - '-vbr off'        → Already default for libopus
-    //
-    // Using only: input file → libopus encoder → Ogg container → stdout
     const ffmpeg = spawn(ffmpegPath, [
       '-i', audioPath,
       '-c:a', 'libopus',
@@ -186,7 +238,6 @@ tokens.forEach((token, index) => {
 
     currentFfmpeg = ffmpeg;
 
-    // Log ffmpeg stderr for debugging
     let stderrData = '';
     ffmpeg.stderr.on('data', (data) => {
       stderrData += data.toString();
@@ -198,16 +249,12 @@ tokens.forEach((token, index) => {
     });
 
     ffmpeg.on('exit', (code, signal) => {
-      console.log(`[Bot ${botNum}] FFmpeg exit: code=${code}, signal=${signal}`);
       if (code !== 0) {
         console.error(`[Bot ${botNum}] FFmpeg stderr: ${stderrData.slice(-500)}`);
       }
       if (currentFfmpeg === ffmpeg) currentFfmpeg = null;
     });
 
-    // FIXED: Use OggOpus stream type (most compatible with @discordjs/voice)
-    // StreamType.Opus expects raw Opus packets without container
-    // StreamType.OggOpus expects Ogg container with Opus (more reliable)
     let resource;
     try {
       resource = createAudioResource(ffmpeg.stdout, {
@@ -220,19 +267,7 @@ tokens.forEach((token, index) => {
       return null;
     }
 
-    // FIXED: Verify resource has required methods before attaching listeners
-    if (!resource || typeof resource.playStream === 'undefined' && typeof resource.volume === 'undefined') {
-      console.error(`[Bot ${botNum}] Invalid AudioResource returned`);
-      killFfmpeg();
-      return null;
-    }
-
     currentResource = resource;
-
-    // FIXED: Use AudioPlayer events instead of resource events
-    // AudioResource in @discordjs/voice may not emit 'end'/'error' events directly
-    // The AudioPlayer's stateChange event handles playback completion
-
     return resource;
   };
 
@@ -254,21 +289,13 @@ tokens.forEach((token, index) => {
     });
     
     player.on('stateChange', (oldState, newState) => {
-      console.log(`[Bot ${botNum}] Player: ${oldState.status} -> ${newState.status}`);
       if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
-        console.log(`[Bot ${botNum}] Player idle - cleaning up ffmpeg`);
         killFfmpeg();
         if (audioPlayCount < maxAudioPlays) {
-          setTimeout(() => playTrack(), 100);
+          playTrack();
         } else {
           console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
         }
-      }
-      if (newState.status === AudioPlayerStatus.Playing) {
-        console.log(`[Bot ${botNum}] Playback started successfully`);
-      }
-      if (newState.status === AudioPlayerStatus.Buffering) {
-        console.log(`[Bot ${botNum}] Buffering audio...`);
       }
     });
     
@@ -286,11 +313,6 @@ tokens.forEach((token, index) => {
     
     audioPlayCount++;
     console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
-
-    if (!fs.existsSync(audioPath)) {
-      console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
-      return;
-    }
 
     const resource = createOptimizedResource();
     if (!resource) {
@@ -312,8 +334,6 @@ tokens.forEach((token, index) => {
       console.error(`[Bot ${botNum}] startPlayback: No connection`);
       return;
     }
-    const connStatus = connection.state?.status;
-    console.log(`[Bot ${botNum}] startPlayback: connection status = ${connStatus}`);
     
     stopRequested = false;
     audioPlayCount = 0;
@@ -535,6 +555,9 @@ tokens.forEach((token, index) => {
     } catch (err) {
       console.error(`[Bot ${botNum}] Slash command registration failed: ${err.message}`);
     }
+
+    // Pre-load audio for instant playback
+    preloadAudio().catch(() => {});
 
     // Auto-join and auto-start playback when environment variables are set.
     try {
