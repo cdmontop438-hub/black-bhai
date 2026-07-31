@@ -17,9 +17,8 @@ const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
-const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;   // ⚡ 300ms smooth stagger (prevents connection aborts)
-const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 3;   // ⚡ 3 parallel joins (prevents UDP port congestion)
-const PCM_CONVERT_CONCURRENCY = parseInt(process.env.PCM_CONVERT_CONCURRENCY, 10) || 2;
+const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;
+const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 3;
 const joinQueue = [];
 const activeJoinTasks = new Set();
 let joinQueueProcessing = false;
@@ -52,10 +51,7 @@ const enqueueJoinTask = (task) => {
   }
 };
 
-// 🛠️ FIXED: Moderate saturation & boost filter chain
-// Old filter was WAY too aggressive (volume=25dB + volume=10dB + acrusher bits=8)
-// causing ffmpeg to produce garbage/corrupted PCM output → audio stuck/silent
-// New filter: reduced volume boosts, increased acrusher bits for cleaner output
+// Moderate saturation & boost filter chain
 const DISTORTION_FILTER = [
   'volume=10dB',
   'acrusher=level_in=1:level_out=1:bits=12:mode=log:aa=1',
@@ -63,121 +59,6 @@ const DISTORTION_FILTER = [
   'volume=5dB',
   'alimiter=limit=0.99:level=true'
 ].join(',');
-
-const convertAudioFile = async (inputPath, outputPath) => {
-  return new Promise((resolve, reject) => {
-    const conv = spawn(ffmpegPath, [
-      '-y', '-i', inputPath,
-      '-af', DISTORTION_FILTER,
-      '-ar', '48000', '-ac', '2', '-f', 's16le',
-      outputPath
-    ]);
-    // 🛠️ FIXED: Log ffmpeg stderr for debugging conversion failures
-    let stderrLog = '';
-    conv.stderr.on('data', (chunk) => {
-      stderrLog += chunk.toString();
-    });
-    conv.on('error', err => {
-      console.error(`[Convert] ffmpeg spawn error:`, err.message);
-      reject(err);
-    });
-    conv.on('close', code => {
-      if (code === 0) {
-        // 🛠️ FIXED: Validate PCM file exists and has content
-        try {
-          const stats = fs.statSync(outputPath);
-          if (stats.size === 0) {
-            console.error(`[Convert] PCM file is empty: ${outputPath}`);
-            reject(new Error(`PCM file is empty: ${outputPath}`));
-            return;
-          }
-          console.log(`[Convert] OK ${path.basename(outputPath)} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-          resolve();
-        } catch (statErr) {
-          reject(new Error(`PCM validation failed: ${statErr.message}`));
-        }
-      } else {
-        console.error(`[Convert] ffmpeg failed with code ${code}. Stderr:\n${stderrLog.slice(-2000)}`);
-        reject(new Error(`ffmpeg convert failed with code ${code}`));
-      }
-    });
-  });
-};
-
-const ensurePcmFile = async (audioPath) => {
-  const pcmPath = audioPath.replace(/\.mp3$/i, '.pcm');
-  // 🛠️ FIXED: Validate existing PCM file is not corrupt (check size > 1KB)
-  if (fs.existsSync(pcmPath)) {
-    try {
-      const stats = fs.statSync(pcmPath);
-      if (stats.size > 1024) {
-        return pcmPath;
-      }
-      console.warn(`[PCM] Existing PCM file too small (${stats.size} bytes), reconverting...`);
-      fs.unlinkSync(pcmPath);
-    } catch (e) {
-      // ignore stat errors
-    }
-  }
-  // Fallback: convert if somehow missing or corrupt
-  await convertAudioFile(audioPath, pcmPath);
-  return pcmPath;
-};
-
-const preconvertMissingAudioFiles = async () => {
-  const audioFiles = [];
-  for (let i = 1; i <= 10; i += 1) {
-    audioFiles.push(`BOOGEYMAN.KX4.DARK.AUDIO.${i}.mp3`);
-  }
-
-  console.log(`[PCM] Preconverting up to ${audioFiles.length} missing PCM files with concurrency ${PCM_CONVERT_CONCURRENCY}...`);
-
-  const tasks = audioFiles.map(file => async () => {
-    const audioPath = path.join(__dirname, file);
-    const pcmPath = audioPath.replace(/\.mp3$/i, '.pcm');
-    if (!fs.existsSync(audioPath)) {
-      console.log(`[PCM] SKIP missing audio file ${file}`);
-      return;
-    }
-    // Always re-bake PCM with boosted volume
-    if (fs.existsSync(pcmPath)) {
-      try { 
-        // Only delete if it's corrupt (too small)
-        const stats = fs.statSync(pcmPath);
-        if (stats.size > 1024) {
-          console.log(`[PCM] SKIP ${file} (already converted, ${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-          return;
-        }
-        fs.unlinkSync(pcmPath); 
-      } catch (e) {}
-    }
-    try {
-      await convertAudioFile(audioPath, pcmPath);
-      console.log(`[PCM] Converted ${file}`);
-    } catch (err) {
-      console.error(`[PCM] Failed to convert ${file}:`, err.message || err);
-    }
-  });
-
-  const active = [];
-  for (const task of tasks) {
-    while (active.length >= PCM_CONVERT_CONCURRENCY) {
-      await Promise.race(active);
-      for (let i = active.length - 1; i >= 0; i -= 1) {
-        if (active[i].isFulfilled || active[i].isRejected) {
-          active.splice(i, 1);
-        }
-      }
-    }
-    const promise = task();
-    promise.isFulfilled = false;
-    promise.isRejected = false;
-    promise.then(() => { promise.isFulfilled = true; }, () => { promise.isRejected = true; });
-    active.push(promise);
-  }
-  await Promise.allSettled(active);
-  console.log('[PCM] Preconversion complete.');
-};
 
 require('opusscript');
 require('libsodium-wrappers');
@@ -216,8 +97,6 @@ if (!tokens.length) {
 
 console.log(`Starting ${tokens.length} bots in NUCLEAR STACKED mode...`);
 
-void preconvertMissingAudioFiles().catch(err => console.error('[PCM] Preconversion error:', err));
-
 let sharedChstStartTime = 0;
 const getSharedChstStartTime = () => {
   if (sharedChstStartTime <= Date.now()) {
@@ -253,15 +132,12 @@ tokens.forEach((token, index) => {
   let maxAudioPlays = 10;
   let playbackTimeout = null;
 
-  // 🛠️ FIXED: Clean up player and connection resources
+  // 🛠️ FIXED: Only clean up player and timeout — do NOT kill ffmpeg here
+  // (ffmpeg is killed separately to avoid cutting off the live stream)
   const cleanupPlayer = () => {
     if (playbackTimeout) {
       clearTimeout(playbackTimeout);
       playbackTimeout = null;
-    }
-    if (currentFfmpegProcess) {
-      currentFfmpegProcess.kill();
-      currentFfmpegProcess = null;
     }
     if (player) {
       try {
@@ -272,7 +148,16 @@ tokens.forEach((token, index) => {
     }
   };
 
-  // Reusable playback starter so we can trigger playback from commands or auto-join
+  const killFfmpeg = () => {
+    if (currentFfmpegProcess) {
+      currentFfmpegProcess.kill();
+      currentFfmpegProcess = null;
+    }
+  };
+
+  // 🛠️ FIXED: Use live ffmpeg streaming as the PRIMARY method
+  // Removed PCM pre-conversion which caused race conditions and corrupted files
+  // The ffmpeg live stream applies the distortion filter and pipes directly to the player
   const startPlayback = async () => {
     if (!connection) {
       console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
@@ -284,8 +169,9 @@ tokens.forEach((token, index) => {
     stopRequested = false;
     audioPlayCount = 0;
 
-    // 🛠️ FIXED: Clean up any existing player before starting fresh
+    // Clean up any existing player before starting fresh
     cleanupPlayer();
+    killFfmpeg();
 
     const playOnce = async () => {
       if (stopRequested) return;
@@ -296,38 +182,36 @@ tokens.forEach((token, index) => {
       audioPlayCount++;
       console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays}) -> ${audioPath}`);
 
-      let resource;
-      try {
-        const pcmPath = await ensurePcmFile(audioPath);
-        // ⚡ 128KB stream buffer prevents audio stuttering ("strucking") on cloud hosts
-        const stream = fs.createReadStream(pcmPath, { highWaterMark: 128 * 1024 });
-        resource = createAudioResource(stream, { inputType: StreamType.Raw, inlineVolume: true });
-      } catch (err) {
-        console.warn(`[Bot ${botNum}] PCM fallback to ffmpeg stream:`, err.message || err);
-        // Same distortion chain applied in live stream fallback
-        const ffmpegArgs = [
-          '-i', audioPath,
-          '-af', DISTORTION_FILTER,
-          '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'
-        ];
-        if (currentFfmpegProcess) {
-          currentFfmpegProcess.kill();
-          currentFfmpegProcess = null;
+      // 🛠️ FIXED: Always use live ffmpeg streaming with distortion filter
+      // This avoids file-based race conditions and PCM corruption issues
+      const ffmpegArgs = [
+        '-i', audioPath,
+        '-af', DISTORTION_FILTER,
+        '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'
+      ];
+      killFfmpeg();
+      currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
+      const resource = createAudioResource(currentFfmpegProcess.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+      currentFfmpegProcess.stderr.on('data', chunk => {
+        const msg = chunk.toString().trim();
+        if (msg) console.error(`[Bot ${botNum}] FFMPEG: ${msg}`);
+      });
+      currentFfmpegProcess.on('error', err => console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message));
+      // If ffmpeg exits unexpectedly, try next play
+      currentFfmpegProcess.on('exit', (code) => {
+        if (code !== 0 && code !== null) {
+          console.warn(`[Bot ${botNum}] FFMPEG exited with code ${code}`);
         }
-        currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
-        resource = createAudioResource(currentFfmpegProcess.stdout, { inputType: StreamType.Raw, inlineVolume: true });
-        currentFfmpegProcess.stderr.on('data', chunk => console.error(`[Bot ${botNum}] FFMPEG: ${chunk.toString().trim()}`));
-        currentFfmpegProcess.on('error', err => console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message));
-      }
+      });
 
       if (resource.volume) resource.volume.setVolume(1.0);
 
-      // 🛠️ FIXED: Create a fresh player for each play cycle to avoid state issues
+      // 🛠️ FIXED: Create fresh player — do NOT call cleanupPlayer() here
+      // (it would kill the ffmpeg process we just started!)
       cleanupPlayer();
       player = createAudioPlayer();
       player.on('error', err => {
         console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message);
-        // Auto-recover: try to play next track on error
         if (!stopRequested && audioPlayCount < maxAudioPlays) {
           setTimeout(() => {
             playOnce().catch(e => console.error(`[Bot ${botNum}] playOnce recovery error:`, e?.message || e));
@@ -336,24 +220,35 @@ tokens.forEach((token, index) => {
       });
       player.on('stateChange', (o, n) => {
         console.log(`[Bot ${botNum}] PLAYER STATE: ${o.status} -> ${n.status}`);
+        // 🛠️ FIXED: Only advance to next play when audio actually finishes playing
         if (n.status === AudioPlayerStatus.Idle && !stopRequested && audioPlayCount < maxAudioPlays) {
-          setTimeout(() => {
-            playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err));
-          }, 100);
+          // If we never reached playing state, the stream was empty — retry with delay
+          if (o.status === AudioPlayerStatus.Buffering) {
+            console.warn(`[Bot ${botNum}] ⚠️ Stream ended before playing (empty resource) — retrying...`);
+            setTimeout(() => {
+              playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce retry error:`, err?.message || err));
+            }, 200);
+          } else {
+            // Normal completion — advance to next play
+            setTimeout(() => {
+              playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err));
+            }, 100);
+          }
         }
       });
 
-      // 🛠️ FIXED: Add playback timeout to detect stuck audio
+      // 🛠️ FIXED: 60-second timeout per track (audio files are long)
       if (playbackTimeout) clearTimeout(playbackTimeout);
       playbackTimeout = setTimeout(() => {
-        console.warn(`[Bot ${botNum}] ⚠️ Playback timeout (${audioPlayCount}/${maxAudioPlays}) - resetting player`);
+        console.warn(`[Bot ${botNum}] ⚠️ Playback timeout (${audioPlayCount}/${maxAudioPlays}) — resetting`);
         if (!stopRequested && audioPlayCount < maxAudioPlays) {
           cleanupPlayer();
+          killFfmpeg();
           setTimeout(() => {
             playOnce().catch(e => console.error(`[Bot ${botNum}] timeout recovery error:`, e?.message || e));
           }, 500);
         }
-      }, 30000); // 30 second timeout per track
+      }, 60000);
 
       player.play(resource);
       const subscription = connection.subscribe(player);
@@ -399,18 +294,19 @@ tokens.forEach((token, index) => {
       });
       connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
-        // Auto-cleanup player on disconnect
         cleanupPlayer();
+        killFfmpeg();
       });
       connection.on(VoiceConnectionStatus.Destroyed, () => {
         console.log(`[Bot ${botNum}] VOICE DESTROYED`);
         cleanupPlayer();
+        killFfmpeg();
       });
       connection.on('stateChange', (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
       });
 
-      await entersState(connection, VoiceConnectionStatus.Ready, 25000); // ⚡ 25s ready wait for cloud servers
+      await entersState(connection, VoiceConnectionStatus.Ready, 25000);
       console.log(`[Bot ${botNum}] JOINED ✅`);
       await reply('✅ Joined your voice channel.');
     } catch (err) {
@@ -449,7 +345,6 @@ tokens.forEach((token, index) => {
       if (allowedRoleIds.length === 0) {
         return reply('❌ You need **Administrator** permissions to use this command.');
       }
-      // Build role mention list for a helpful error message
       const roleMentions = allowedRoleIds
         .map(id => `<@&${id}>`)
         .join(', ');
@@ -473,11 +368,9 @@ tokens.forEach((token, index) => {
     if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      // Use bot-specific audio file (allow using pre-converted .pcm if .mp3 is missing)
       const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
-      const botPcm = botAudio.replace(/\.mp3$/i, '.pcm');
-      if (!fs.existsSync(botAudio) && !fs.existsSync(botPcm)) {
-        return reply(`BOOGEYMAN audio file ${botNum} not found (mp3 or pcm missing).`);
+      if (!fs.existsSync(botAudio)) {
+        return reply(`BOOGEYMAN audio file ${botNum} not found.`);
       }
 
       // Align start time across bots for synchronized playback
@@ -494,11 +387,13 @@ tokens.forEach((token, index) => {
       stopRequested = true;
       audioPlayCount = 0;
       cleanupPlayer();
+      killFfmpeg();
       return reply('✅ Audio stopped.');
     }
 
     if (commandName === 'bklv') {
       cleanupPlayer();
+      killFfmpeg();
       safeDestroy(connection);
       connection = null;
       return reply('✅ Left voice channel.');
@@ -530,7 +425,6 @@ ${msg}
     const content = message.content.trim().toLowerCase();
     if (!['!bkva', '!bkst', '!bksp', '!bklv', '!status'].includes(content)) return;
 
-    // ⚡ Only Bot 1 sends text chat responses to prevent 10x spam & Missing Permission errors
     const reply = async text => {
       if (botNum !== 1) return;
       try {
@@ -572,7 +466,6 @@ ${msg}
           if (!targetChannel || !targetChannel.isVoiceBased && !targetChannel.isStageBased) {
             console.warn(`[Bot ${botNum}] AUTO_JOIN: channel ${envChannel} not found or not a voice channel`);
           } else {
-            // join
             connection = joinVoiceChannel({
               channelId: targetChannel.id,
               guildId: targetChannel.guild.id,
