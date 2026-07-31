@@ -13,6 +13,7 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 // Ensure ffmpeg is accessible for prism-media transcoding
@@ -127,15 +128,93 @@ tokens.forEach((token, index) => {
   let isJoining = false;
   let audioPlayCount = 0;
   let maxAudioPlays = 10;
+  let currentFfmpeg = null;
+  let currentResource = null;
 
-  // FIXED: Use MP3 files (tracked by git, deployed on Render)
-  // PCM files are NOT in git and won't exist on Render
+  // Use MP3 files (tracked by git, deployed on Render)
   const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
 
   // ========== AUDIO SYSTEM ==========
+  
+  // Kill any running ffmpeg process
+  const killFfmpeg = () => {
+    if (currentFfmpeg) {
+      try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
+      currentFfmpeg = null;
+    }
+  };
+
+  // Create an optimized audio resource using ffmpeg
+  // Decodes MP3 → encodes to Opus directly in a single process
+  // Uses optimal Discord parameters: 128k CBR, 20ms frames, low delay, FEC
+  const createOptimizedResource = () => {
+    if (!fs.existsSync(audioPath)) {
+      console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
+      return null;
+    }
+
+    killFfmpeg();
+
+    // Single ffmpeg process: MP3 → Opus with optimal Discord parameters
+    // - 128k CBR: Consistent bitrate prevents jitter
+    // - 20ms frames: Standard Discord frame size
+    // - lowdelay: Minimizes latency
+    // - packet_loss=15: FEC conceals packet loss
+    const ffmpeg = spawn(ffmpegPath, [
+      '-i', audioPath,
+      '-c:a', 'libopus',
+      '-b:a', '128k',
+      '-ar', '48000',
+      '-ac', '2',
+      '-frame_duration', '20',
+      '-application', 'lowdelay',
+      '-vbr', 'off',
+      '-f', 'opus',
+      '-packet_loss', '15',
+      '-compression_level', '10',
+      'pipe:1'
+    ], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    currentFfmpeg = ffmpeg;
+
+    ffmpeg.on('error', (err) => {
+      console.error(`[Bot ${botNum}] FFmpeg error:`, err.message);
+      killFfmpeg();
+    });
+
+    ffmpeg.on('exit', (code) => {
+      if (code !== 0) {
+        console.error(`[Bot ${botNum}] FFmpeg exit code ${code}`);
+      }
+      if (currentFfmpeg === ffmpeg) currentFfmpeg = null;
+    });
+
+    // Create resource directly from ffmpeg's Opus output
+    // StreamType.Opus tells discord.js the data is already Opus-encoded
+    const resource = createAudioResource(ffmpeg.stdout, {
+      inputType: StreamType.Opus,
+      inlineVolume: true
+    });
+
+    currentResource = resource;
+
+    resource.on('end', () => {
+      if (currentFfmpeg === ffmpeg) killFfmpeg();
+      currentResource = null;
+    });
+
+    resource.on('error', (err) => {
+      console.error(`[Bot ${botNum}] Resource error:`, err.message);
+      if (currentFfmpeg === ffmpeg) killFfmpeg();
+      currentResource = null;
+    });
+
+    return resource;
+  };
 
   const setupPlayer = () => {
-    // Destroy existing player cleanly
     if (player) {
       try { player.stop(true); } catch (e) {}
       player.removeAllListeners();
@@ -143,10 +222,10 @@ tokens.forEach((token, index) => {
     }
     
     player = createAudioPlayer();
-    console.log(`[Bot ${botNum}] AudioPlayer created`);
     
     player.on('error', err => {
       console.error(`[Bot ${botNum}] Player error:`, err.message);
+      killFfmpeg();
       if (!stopRequested) {
         setTimeout(() => playTrack(), 1000);
       }
@@ -155,6 +234,7 @@ tokens.forEach((token, index) => {
     player.on('stateChange', (oldState, newState) => {
       console.log(`[Bot ${botNum}] Player: ${oldState.status} -> ${newState.status}`);
       if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
+        killFfmpeg();
         if (audioPlayCount < maxAudioPlays) {
           setTimeout(() => playTrack(), 100);
         } else {
@@ -163,20 +243,13 @@ tokens.forEach((token, index) => {
       }
     });
     
-    // Subscribe player to connection
     if (connection) {
       connection.subscribe(player);
-      console.log(`[Bot ${botNum}] AudioPlayer subscribed to connection`);
-    } else {
-      console.error(`[Bot ${botNum}] No connection to subscribe player to`);
     }
   };
 
   const playTrack = () => {
-    if (stopRequested) {
-      console.log(`[Bot ${botNum}] playTrack: stopped`);
-      return;
-    }
+    if (stopRequested) return;
     if (audioPlayCount >= maxAudioPlays) {
       console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
       return;
@@ -185,29 +258,23 @@ tokens.forEach((token, index) => {
     audioPlayCount++;
     console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
 
-    // Check file exists
     if (!fs.existsSync(audioPath)) {
       console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
       return;
     }
-    console.log(`[Bot ${botNum}] Audio file exists: ${audioPath}`);
 
-    // FIXED: Use StreamType.Arbitrary for MP3 files
-    // prism-media will use ffmpeg to transcode MP3 to Opus automatically
-    const stream = fs.createReadStream(audioPath);
-    console.log(`[Bot ${botNum}] File stream created`);
-    
-    const resource = createAudioResource(stream, { 
-      inputType: StreamType.Arbitrary,
-      inlineVolume: true
-    });
-    console.log(`[Bot ${botNum}] AudioResource created with StreamType.Arbitrary`);
+    const resource = createOptimizedResource();
+    if (!resource) {
+      if (!stopRequested) {
+        setTimeout(() => playTrack(), 1000);
+      }
+      return;
+    }
 
     if (player) {
       player.play(resource);
-      console.log(`[Bot ${botNum}] player.play() called`);
     } else {
-      console.error(`[Bot ${botNum}] No player available to play resource`);
+      console.error(`[Bot ${botNum}] No player available`);
     }
   };
 
