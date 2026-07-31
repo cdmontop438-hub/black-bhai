@@ -17,9 +17,9 @@ const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
-const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 30;   // ⚡ fast stagger
-const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 10; // ⚡ more parallel joins
-const PCM_CONVERT_CONCURRENCY = parseInt(process.env.PCM_CONVERT_CONCURRENCY, 10) || 5;
+const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;   // ⚡ 300ms smooth stagger (prevents connection aborts)
+const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 3;   // ⚡ 3 parallel joins (prevents UDP port congestion)
+const PCM_CONVERT_CONCURRENCY = parseInt(process.env.PCM_CONVERT_CONCURRENCY, 10) || 2;
 const joinQueue = [];
 const activeJoinTasks = new Set();
 let joinQueueProcessing = false;
@@ -236,7 +236,8 @@ tokens.forEach((token, index) => {
       let resource;
       try {
         const pcmPath = await ensurePcmFile(audioPath);
-        const stream = fs.createReadStream(pcmPath);
+        // ⚡ 128KB stream buffer prevents audio stuttering ("strucking") on cloud hosts
+        const stream = fs.createReadStream(pcmPath, { highWaterMark: 128 * 1024 });
         resource = createAudioResource(stream, { inputType: StreamType.Raw, inlineVolume: true });
       } catch (err) {
         console.warn(`[Bot ${botNum}] PCM fallback to ffmpeg stream:`, err.message || err);
@@ -322,7 +323,7 @@ tokens.forEach((token, index) => {
         console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
       });
 
-      await entersState(connection, VoiceConnectionStatus.Ready, 10000); // ⚡ faster timeout
+      await entersState(connection, VoiceConnectionStatus.Ready, 25000); // ⚡ 25s ready wait for cloud servers
       console.log(`[Bot ${botNum}] JOINED ✅`);
       await reply('✅ Joined your voice channel.');
     } catch (err) {
@@ -448,16 +449,13 @@ ${msg}
     const content = message.content.trim().toLowerCase();
     if (!['!bkva', '!bkst', '!bksp', '!bklv', '!status'].includes(content)) return;
 
+    // ⚡ Only Bot 1 sends text chat responses to prevent 10x spam & Missing Permission errors
     const reply = async text => {
+      if (botNum !== 1) return;
       try {
-        const perms = message.channel.permissionsFor(message.guild?.members?.me ?? client.user);
-        if (!perms || !perms.has('SendMessages')) {
-          console.error(`[Bot ${botNum}] MESSAGE REPLY FAILED: Missing Permissions`);
-          return;
-        }
-        await message.reply(text);
+        await message.reply(text).catch(() => {});
       } catch (err) {
-        console.error(`[Bot ${botNum}] MESSAGE REPLY FAILED:`, err.message);
+        // ignore reply error
       }
     };
 
