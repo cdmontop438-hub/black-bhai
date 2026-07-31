@@ -676,7 +676,7 @@ tokens.forEach((token, index) => {
       const delay = Math.max(100, startAt - Date.now());
       console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
 
-      // Spawn ffmpeg immediately
+      // Spawn ffmpeg immediately so it's ready when playback starts
       console.log(`[Bot ${botNum}] Starting ffmpeg...`);
       const ffmpeg = spawnFfmpeg();
       if (!ffmpeg) {
@@ -685,9 +685,9 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Wait for ffmpeg to start producing audio data
-      waitForFfmpegReady(ffmpeg, delay + 2000).then(() => {
-        console.log(`[Bot ${botNum}] FFmpeg ready, starting playback...`);
+      // Create resource and start playback at synchronized time
+      setTimeout(() => {
+        console.log(`[Bot ${botNum}] Creating resource and starting playback...`);
         try {
           const resource = createAudioResource(ffmpeg.stdout, {
             inputType: StreamType.OggOpus,
@@ -702,26 +702,7 @@ tokens.forEach((token, index) => {
         } catch (err) {
           console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
         }
-      }).catch(err => {
-        console.error(`[Bot ${botNum}] FFmpeg ready failed:`, err.message);
-        // Fallback: try to start anyway
-        setTimeout(() => {
-          try {
-            const resource = createAudioResource(ffmpeg.stdout, {
-              inputType: StreamType.OggOpus,
-              inlineVolume: true
-            });
-            
-            stopRequested = false;
-            audioPlayCount = 0;
-            setupPlayer();
-            player.play(resource);
-            console.log(`[Bot ${botNum}] Playback started (fallback) ✅`);
-          } catch (e) {
-            console.error(`[Bot ${botNum}] Fallback failed:`, e.message);
-          }
-        }, delay);
-      });
+      }, delay);
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
