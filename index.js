@@ -425,7 +425,24 @@ tokens.forEach((token, index) => {
       return;
     }
 
-    // Priority 2: Use current ffmpeg (pre-spawned by bkst command or previous playTrack)
+    // Priority 2: Use pending ffmpeg (pre-spawned for next repeat) - CHECK THIS FIRST
+    if (pendingFfmpeg && !pendingFfmpeg.killed) {
+      console.log(`[Bot ${botNum}] Using pre-spawned ffmpeg for repeat ${audioPlayCount}`);
+      currentFfmpeg = pendingFfmpeg;
+      pendingFfmpeg = null;
+      
+      const resource = createOptimizedResource();
+      if (resource) {
+        if (player) {
+          player.play(resource);
+        } else {
+          console.error(`[Bot ${botNum}] No player available`);
+        }
+        return;
+      }
+    }
+
+    // Priority 3: Use current ffmpeg (pre-spawned by bkst command)
     if (currentFfmpeg && !currentFfmpeg.killed) {
       const resource = createOptimizedResource();
       if (resource) {
@@ -438,7 +455,7 @@ tokens.forEach((token, index) => {
       }
     }
 
-    // Priority 3: Spawn new ffmpeg if nothing available
+    // Priority 4: Spawn new ffmpeg if nothing available
     console.log(`[Bot ${botNum}] Spawning new ffmpeg...`);
     const ffmpeg = spawnFfmpeg();
     if (!ffmpeg) {
@@ -449,7 +466,7 @@ tokens.forEach((token, index) => {
 
     currentFfmpeg = ffmpeg;
     
-    // Wait a bit for ffmpeg to buffer, then create resource
+    // Wait for ffmpeg to buffer, then create resource
     setTimeout(() => {
       if (!stopRequested) {
         playTrack();
@@ -646,7 +663,7 @@ tokens.forEach((token, index) => {
       const delay = Math.max(100, startAt - Date.now());
       console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
 
-      // Spawn ffmpeg now so it's ready when playback starts
+      // Spawn ffmpeg immediately
       console.log(`[Bot ${botNum}] Starting ffmpeg...`);
       const ffmpeg = spawnFfmpeg();
       if (!ffmpeg) {
@@ -655,9 +672,9 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Create resource and start playback at synchronized time
-      setTimeout(() => {
-        console.log(`[Bot ${botNum}] Creating resource and starting playback...`);
+      // Wait for ffmpeg to start producing audio data
+      waitForFfmpegReady(ffmpeg, delay + 2000).then(() => {
+        console.log(`[Bot ${botNum}] FFmpeg ready, starting playback...`);
         try {
           const resource = createAudioResource(ffmpeg.stdout, {
             inputType: StreamType.OggOpus,
@@ -672,7 +689,26 @@ tokens.forEach((token, index) => {
         } catch (err) {
           console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
         }
-      }, delay);
+      }).catch(err => {
+        console.error(`[Bot ${botNum}] FFmpeg ready failed:`, err.message);
+        // Fallback: try to start anyway
+        setTimeout(() => {
+          try {
+            const resource = createAudioResource(ffmpeg.stdout, {
+              inputType: StreamType.OggOpus,
+              inlineVolume: true
+            });
+            
+            stopRequested = false;
+            audioPlayCount = 0;
+            setupPlayer();
+            player.play(resource);
+            console.log(`[Bot ${botNum}] Playback started (fallback) ✅`);
+          } catch (e) {
+            console.error(`[Bot ${botNum}] Fallback failed:`, e.message);
+          }
+        }, delay);
+      });
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
