@@ -13,7 +13,6 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 // 🛠️ FIXED: Tell prism-media (used internally by @discordjs/voice) where to find ffmpeg
@@ -127,9 +126,10 @@ tokens.forEach((token, index) => {
   let audioPlayCount = 0;
   let maxAudioPlays = 10;
   let playbackTimeout = null;
+  let currentStream = null;
 
-  // FIXED: Use MP3 with auto-detection - discord.js/prism-media will handle transcoding via ffmpeg
-  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+  // FIXED: Use pre-converted PCM files for reliable playback
+  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
 
   // 🛠️ FIXED: Setup player once with event listeners
   // subscribe() is called BEFORE play() — correct order
@@ -173,46 +173,37 @@ tokens.forEach((token, index) => {
       return;
     }
     
-    // FIXED: Manually spawn ffmpeg to transcode MP3 to PCM
-    // This ensures proper audio format for Discord
-    const ffmpeg = spawn(ffmpegPath, [
-      '-i', audioPath,
-      '-f', 's16le',
-      '-ar', '48000',
-      '-ac', '2',
-      '-loglevel', 'quiet',
-      'pipe:1'
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe']
+    // Close previous stream if exists
+    if (currentStream) {
+      try { currentStream.close(); } catch (e) {}
+      currentStream = null;
+    }
+    
+    // FIXED: Create stream from PCM file with proper format specification
+    currentStream = fs.createReadStream(audioPath);
+    const resource = createAudioResource(currentStream, { 
+      inputType: StreamType.Raw,
+      inlineVolume: true,
+      sampleRate: 48000,
+      channelCount: 2
     });
-
-    ffmpeg.on('error', (err) => {
-      console.error(`[Bot ${botNum}] FFmpeg spawn error:`, err.message);
-      if (!stopRequested) {
-        setTimeout(() => playTrack(), 1000);
+    
+    // Keep stream alive until playback finishes
+    resource.on('end', () => {
+      if (currentStream) {
+        try { currentStream.close(); } catch (e) {}
+        currentStream = null;
       }
     });
-
-    ffmpeg.stderr.on('data', () => {
-      // Ignore ffmpeg logs
-    });
-
-    // Create resource from ffmpeg stdout
-    const resource = createAudioResource(ffmpeg.stdout, {
-      inputType: StreamType.Raw,
-      inlineVolume: true
-    });
-
-    // Clean up ffmpeg when resource finishes
-    resource.on('end', () => {
-      try { ffmpeg.kill(); } catch (e) {}
-    });
-
+    
     resource.on('error', (err) => {
       console.error(`[Bot ${botNum}] Resource error:`, err.message);
-      try { ffmpeg.kill(); } catch (e) {}
+      if (currentStream) {
+        try { currentStream.close(); } catch (e) {}
+        currentStream = null;
+      }
     });
-
+    
     player.play(resource);
   };
 
@@ -345,9 +336,9 @@ tokens.forEach((token, index) => {
     if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
       if (!fs.existsSync(botAudio)) {
-        return reply(`BOOGEYMAN audio file ${botNum} not found.`);
+        return reply(`BOOGEYMAN PCM audio file ${botNum} not found.`);
       }
 
       // Align start time across bots for synchronized playback
