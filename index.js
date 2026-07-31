@@ -132,6 +132,7 @@ tokens.forEach((token, index) => {
   let currentResource = null;
   let preloadedFfmpeg = null;
   let preloadedResource = null;
+  let pendingFfmpeg = null; // For bkst command pre-spawned ffmpeg
 
   // Use the new compressed audio file for all bots
   const audioPath = path.join(__dirname, 'V.2 DARK BOOGEYMAN 4LUVONTOP (1)_compressed.mp3');
@@ -165,7 +166,8 @@ tokens.forEach((token, index) => {
       const timer = setTimeout(() => {
         reject(new Error('FFmpeg ready timeout'));
       }, timeout);
-      ffmpeg.stdout.once('data', () => {
+      // Check if ffmpeg is producing data by monitoring stderr for encoding start
+      ffmpeg.stderr.once('data', () => {
         clearTimeout(timer);
         resolve();
       });
@@ -173,6 +175,12 @@ tokens.forEach((token, index) => {
         clearTimeout(timer);
         reject(err);
       });
+      // Also resolve after a short delay to give ffmpeg time to start
+      setTimeout(() => {
+        if (!timer) return; // Already resolved/rejected
+        clearTimeout(timer);
+        resolve();
+      }, 1000);
     });
   };
 
@@ -261,7 +269,26 @@ tokens.forEach((token, index) => {
       preloadedResource = null;
     }
 
-    // Use pre-spawned ffmpeg (from bkst command delay period)
+    // Use pending ffmpeg (pre-spawned for next repeat)
+    if (pendingFfmpeg && !pendingFfmpeg.killed) {
+      const ffmpeg = pendingFfmpeg;
+      pendingFfmpeg = null;
+      currentFfmpeg = ffmpeg;
+      try {
+        const resource = createAudioResource(ffmpeg.stdout, {
+          inputType: StreamType.OggOpus,
+          inlineVolume: true
+        });
+        currentResource = resource;
+        return resource;
+      } catch (err) {
+        console.error(`[Bot ${botNum}] Failed to create resource from pending ffmpeg:`, err.message);
+        killFfmpeg(ffmpeg);
+        currentFfmpeg = null;
+      }
+    }
+
+    // Use current ffmpeg (from bkst command)
     if (currentFfmpeg && !currentFfmpeg.killed) {
       const ffmpeg = currentFfmpeg;
       try {
@@ -351,6 +378,14 @@ tokens.forEach((token, index) => {
     
     player.on('stateChange', (oldState, newState) => {
       if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
+        // Pre-spawn next ffmpeg BEFORE killing current one to avoid buffering
+        if (audioPlayCount < maxAudioPlays) {
+          const nextFfmpeg = spawnFfmpeg();
+          if (nextFfmpeg) {
+            pendingFfmpeg = nextFfmpeg;
+            console.log(`[Bot ${botNum}] Pre-spawned ffmpeg for next repeat`);
+          }
+        }
         killFfmpeg();
         if (audioPlayCount < maxAudioPlays) {
           playTrack();
@@ -365,7 +400,7 @@ tokens.forEach((token, index) => {
     }
   };
 
-  const playTrack = () => {
+  const playTrack = (usePreloaded = false) => {
     if (stopRequested) return;
     if (audioPlayCount >= maxAudioPlays) {
       console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
@@ -374,6 +409,37 @@ tokens.forEach((token, index) => {
     
     audioPlayCount++;
     console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
+
+    // If we have a preloaded resource, use it
+    if (usePreloaded && preloadedResource && preloadedFfmpeg && !preloadedFfmpeg.killed) {
+      const resource = preloadedResource;
+      currentFfmpeg = preloadedFfmpeg;
+      preloadedFfmpeg = null;
+      preloadedResource = null;
+      
+      if (player) {
+        player.play(resource);
+      } else {
+        console.error(`[Bot ${botNum}] No player available`);
+      }
+      return;
+    }
+
+    // For repeats, spawn ffmpeg ahead of time to avoid buffering
+    if (audioPlayCount > 0 && !currentFfmpeg) {
+      console.log(`[Bot ${botNum}] Pre-spawning ffmpeg for next repeat...`);
+      const ffmpeg = spawnFfmpeg();
+      if (ffmpeg) {
+        currentFfmpeg = ffmpeg;
+        // Give ffmpeg 300ms to start buffering before we create resource
+        setTimeout(() => {
+          if (!stopRequested && audioPlayCount < maxAudioPlays) {
+            playTrack();
+          }
+        }, 300);
+        return;
+      }
+    }
 
     const resource = createOptimizedResource();
     if (!resource) {
@@ -588,11 +654,9 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Wait for ffmpeg to produce data
-      waitForFfmpegReady(ffmpeg, 5000).then(() => {
-        console.log(`[Bot ${botNum}] FFmpeg producing data ✅`);
-        
-        // Create audio resource now that ffmpeg is ready
+      // Wait for ffmpeg to buffer enough data, then create resource and schedule
+      setTimeout(() => {
+        console.log(`[Bot ${botNum}] Creating audio resource...`);
         try {
           const resource = createAudioResource(ffmpeg.stdout, {
             inputType: StreamType.OggOpus,
@@ -612,22 +676,7 @@ tokens.forEach((token, index) => {
         } catch (err) {
           console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
         }
-      }).catch(err => {
-        console.error(`[Bot ${botNum}] FFmpeg ready failed:`, err.message);
-        // Try anyway as fallback
-        setTimeout(() => {
-          try {
-            const resource = createAudioResource(ffmpeg.stdout, {
-              inputType: StreamType.OggOpus,
-              inlineVolume: true
-            });
-            currentResource = resource;
-            startPlaybackWithResource(resource);
-          } catch (e) {
-            console.error(`[Bot ${botNum}] Fallback failed:`, e.message);
-          }
-        }, delay);
-      });
+      }, 500); // Wait 500ms for ffmpeg to buffer
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
