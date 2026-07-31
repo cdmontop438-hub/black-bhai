@@ -156,24 +156,23 @@ tokens.forEach((token, index) => {
 
     console.log(`[Bot ${botNum}] Starting ffmpeg...`);
 
-    // FIXED: Removed invalid arguments that caused exit code 224:
-    // - '-packet_loss' is NOT a valid ffmpeg option (caused exit code 224)
-    // - '-f opus' raw muxer may not be available on all builds
-    // - '-compression_level 10' is valid for libopus (0-10)
+    // FIXED: Use only standard ffmpeg options that are guaranteed to work
+    // across all ffmpeg-static builds.
     //
-    // Using Ogg container with Opus codec for maximum compatibility
-    // FEC enabled via '-apply_fec 1' (correct ffmpeg option for libopus)
+    // Removed non-standard options that caused errors:
+    // - '-apply_fec'     → Unrecognized option (libopus AVOption, not ffmpeg option)
+    // - '-frame_duration' → May not be available on all builds
+    // - '-application'    → May not be available on all builds
+    // - '-compression_level' → May not be available on all builds
+    // - '-vbr off'        → Already default for libopus
+    //
+    // Using only: input file → libopus encoder → Ogg container → stdout
     const ffmpeg = spawn(ffmpegPath, [
       '-i', audioPath,
       '-c:a', 'libopus',
       '-b:a', '128k',
       '-ar', '48000',
       '-ac', '2',
-      '-frame_duration', '20',
-      '-application', 'lowdelay',
-      '-vbr', 'off',
-      '-apply_fec', '1',
-      '-compression_level', '10',
       '-f', 'ogg',
       'pipe:1'
     ], {
