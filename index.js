@@ -13,6 +13,8 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
 const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;
@@ -114,6 +116,7 @@ tokens.forEach((token, index) => {
 
   let connection;
   let player;
+  let currentFfmpegProcess = null;
   let stopRequested = false;
   let isJoining = false;
   let audioPlayCount = 0;
@@ -134,9 +137,18 @@ tokens.forEach((token, index) => {
     }
   };
 
-  // 🛠️ FIXED: Use @discordjs/voice's native StreamType.Arbitrary
-  // This lets the library handle the audio conversion internally via its own ffmpeg pipeline
-  // No custom distortion filter — plays the original audio cleanly
+  const killFfmpeg = () => {
+    if (currentFfmpegProcess) {
+      currentFfmpegProcess.kill();
+      currentFfmpegProcess = null;
+    }
+  };
+
+  // 🛠️ FIXED: Use ffmpeg-static to convert MP3 → PCM → pipe to player with StreamType.Raw
+  // This is the most reliable approach because:
+  // 1. We control the ffmpeg binary directly (ffmpeg-static)
+  // 2. StreamType.Raw encodes PCM to Opus using the installed opus modules
+  // 3. No inlineVolume (can cause issues) — just pass raw PCM
   const startPlayback = async () => {
     if (!connection) {
       console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
@@ -149,6 +161,7 @@ tokens.forEach((token, index) => {
     audioPlayCount = 0;
 
     cleanupPlayer();
+    killFfmpeg();
 
     const playOnce = async () => {
       if (stopRequested) return;
@@ -160,13 +173,35 @@ tokens.forEach((token, index) => {
       console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
 
       try {
-        // 🛠️ FIXED: Use native StreamType.Arbitrary — library handles conversion internally
-        // No custom ffmpeg process, no distortion filter, no PCM conversion
-        // This is the most reliable approach for @discordjs/voice
-        const stream = fs.createReadStream(audioPath, { highWaterMark: 128 * 1024 });
-        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
-
-        if (resource.volume) resource.volume.setVolume(1.0);
+        // Convert MP3 to PCM via ffmpeg-static, pipe to player
+        const ffmpegArgs = [
+          '-i', audioPath,
+          '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'
+        ];
+        killFfmpeg();
+        currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
+        
+        // Create resource from ffmpeg stdout (raw PCM)
+        const resource = createAudioResource(currentFfmpegProcess.stdout, { inputType: StreamType.Raw });
+        
+        // Log ffmpeg errors only (not progress)
+        let ffmpegStderr = '';
+        currentFfmpegProcess.stderr.on('data', (chunk) => {
+          const text = chunk.toString();
+          ffmpegStderr += text;
+          // Only log if it's an error (not progress lines)
+          if (text.includes('Error') || text.includes('error') || text.includes('failed')) {
+            console.error(`[Bot ${botNum}] FFMPEG: ${text.trim()}`);
+          }
+        });
+        currentFfmpegProcess.on('error', err => {
+          console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message);
+        });
+        currentFfmpegProcess.on('exit', (code) => {
+          if (code !== 0 && code !== null) {
+            console.error(`[Bot ${botNum}] FFMPEG exited with code ${code}. Stderr:\n${ffmpegStderr.slice(-1000)}`);
+          }
+        });
 
         cleanupPlayer();
         player = createAudioPlayer();
@@ -199,6 +234,7 @@ tokens.forEach((token, index) => {
           console.warn(`[Bot ${botNum}] ⚠️ Playback timeout (${audioPlayCount}/${maxAudioPlays}) — resetting`);
           if (!stopRequested && audioPlayCount < maxAudioPlays) {
             cleanupPlayer();
+            killFfmpeg();
             setTimeout(() => {
               playOnce().catch(e => console.error(`[Bot ${botNum}] timeout recovery error:`, e?.message || e));
             }, 500);
@@ -258,10 +294,12 @@ tokens.forEach((token, index) => {
       connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
         cleanupPlayer();
+        killFfmpeg();
       });
       connection.on(VoiceConnectionStatus.Destroyed, () => {
         console.log(`[Bot ${botNum}] VOICE DESTROYED`);
         cleanupPlayer();
+        killFfmpeg();
       });
       connection.on('stateChange', (oldState, newState) => {
         console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
@@ -348,11 +386,13 @@ tokens.forEach((token, index) => {
       stopRequested = true;
       audioPlayCount = 0;
       cleanupPlayer();
+      killFfmpeg();
       return reply('✅ Audio stopped.');
     }
 
     if (commandName === 'bklv') {
       cleanupPlayer();
+      killFfmpeg();
       safeDestroy(connection);
       connection = null;
       return reply('✅ Left voice channel.');
@@ -363,7 +403,8 @@ tokens.forEach((token, index) => {
         const connState = connection ? (connection.state && connection.state.status) : 'not connected';
         const channelId = connection && connection.joinConfig ? connection.joinConfig.channelId : (connection && connection.joining ? connection.joining.channelId : 'none');
         const playerState = player ? (player.state && player.state.status) : 'no player';
-        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}`;
+        const ffmpegRunning = currentFfmpegProcess ? true : false;
+        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}\nFFmpeg: ${ffmpegRunning}`;
         await reply(`
 
 ${msg}
