@@ -146,7 +146,6 @@ tokens.forEach((token, index) => {
 
   // Create an optimized audio resource using ffmpeg
   // Decodes MP3 → encodes to Opus directly in a single process
-  // Uses optimal Discord parameters: 128k CBR, 20ms frames, low delay, FEC
   const createOptimizedResource = () => {
     if (!fs.existsSync(audioPath)) {
       console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
@@ -155,11 +154,15 @@ tokens.forEach((token, index) => {
 
     killFfmpeg();
 
-    // Single ffmpeg process: MP3 → Opus with optimal Discord parameters
-    // - 128k CBR: Consistent bitrate prevents jitter
-    // - 20ms frames: Standard Discord frame size
-    // - lowdelay: Minimizes latency
-    // - packet_loss=15: FEC conceals packet loss
+    console.log(`[Bot ${botNum}] Starting ffmpeg...`);
+
+    // FIXED: Removed invalid arguments that caused exit code 224:
+    // - '-packet_loss' is NOT a valid ffmpeg option (caused exit code 224)
+    // - '-f opus' raw muxer may not be available on all builds
+    // - '-compression_level 10' is valid for libopus (0-10)
+    //
+    // Using Ogg container with Opus codec for maximum compatibility
+    // FEC enabled via '-apply_fec 1' (correct ffmpeg option for libopus)
     const ffmpeg = spawn(ffmpegPath, [
       '-i', audioPath,
       '-c:a', 'libopus',
@@ -169,9 +172,9 @@ tokens.forEach((token, index) => {
       '-frame_duration', '20',
       '-application', 'lowdelay',
       '-vbr', 'off',
-      '-f', 'opus',
-      '-packet_loss', '15',
+      '-apply_fec', '1',
       '-compression_level', '10',
+      '-f', 'ogg',
       'pipe:1'
     ], {
       stdio: ['pipe', 'pipe', 'pipe']
@@ -179,37 +182,52 @@ tokens.forEach((token, index) => {
 
     currentFfmpeg = ffmpeg;
 
+    // Log ffmpeg stderr for debugging
+    let stderrData = '';
+    ffmpeg.stderr.on('data', (data) => {
+      stderrData += data.toString();
+    });
+
     ffmpeg.on('error', (err) => {
       console.error(`[Bot ${botNum}] FFmpeg error:`, err.message);
       killFfmpeg();
     });
 
-    ffmpeg.on('exit', (code) => {
+    ffmpeg.on('exit', (code, signal) => {
+      console.log(`[Bot ${botNum}] FFmpeg exit: code=${code}, signal=${signal}`);
       if (code !== 0) {
-        console.error(`[Bot ${botNum}] FFmpeg exit code ${code}`);
+        console.error(`[Bot ${botNum}] FFmpeg stderr: ${stderrData.slice(-500)}`);
       }
       if (currentFfmpeg === ffmpeg) currentFfmpeg = null;
     });
 
-    // Create resource directly from ffmpeg's Opus output
-    // StreamType.Opus tells discord.js the data is already Opus-encoded
-    const resource = createAudioResource(ffmpeg.stdout, {
-      inputType: StreamType.Opus,
-      inlineVolume: true
-    });
+    // FIXED: Use OggOpus stream type (most compatible with @discordjs/voice)
+    // StreamType.Opus expects raw Opus packets without container
+    // StreamType.OggOpus expects Ogg container with Opus (more reliable)
+    let resource;
+    try {
+      resource = createAudioResource(ffmpeg.stdout, {
+        inputType: StreamType.OggOpus,
+        inlineVolume: true
+      });
+    } catch (err) {
+      console.error(`[Bot ${botNum}] createAudioResource failed:`, err.message);
+      killFfmpeg();
+      return null;
+    }
+
+    // FIXED: Verify resource has required methods before attaching listeners
+    if (!resource || typeof resource.playStream === 'undefined' && typeof resource.volume === 'undefined') {
+      console.error(`[Bot ${botNum}] Invalid AudioResource returned`);
+      killFfmpeg();
+      return null;
+    }
 
     currentResource = resource;
 
-    resource.on('end', () => {
-      if (currentFfmpeg === ffmpeg) killFfmpeg();
-      currentResource = null;
-    });
-
-    resource.on('error', (err) => {
-      console.error(`[Bot ${botNum}] Resource error:`, err.message);
-      if (currentFfmpeg === ffmpeg) killFfmpeg();
-      currentResource = null;
-    });
+    // FIXED: Use AudioPlayer events instead of resource events
+    // AudioResource in @discordjs/voice may not emit 'end'/'error' events directly
+    // The AudioPlayer's stateChange event handles playback completion
 
     return resource;
   };
@@ -234,12 +252,19 @@ tokens.forEach((token, index) => {
     player.on('stateChange', (oldState, newState) => {
       console.log(`[Bot ${botNum}] Player: ${oldState.status} -> ${newState.status}`);
       if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
+        console.log(`[Bot ${botNum}] Player idle - cleaning up ffmpeg`);
         killFfmpeg();
         if (audioPlayCount < maxAudioPlays) {
           setTimeout(() => playTrack(), 100);
         } else {
           console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
         }
+      }
+      if (newState.status === AudioPlayerStatus.Playing) {
+        console.log(`[Bot ${botNum}] Playback started successfully`);
+      }
+      if (newState.status === AudioPlayerStatus.Buffering) {
+        console.log(`[Bot ${botNum}] Buffering audio...`);
       }
     });
     
