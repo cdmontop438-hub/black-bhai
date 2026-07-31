@@ -637,7 +637,32 @@ tokens.forEach((token, index) => {
       const delay = Math.max(100, startAt - Date.now());
       console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
 
-      // Spawn ffmpeg immediately so it's ready when playback starts
+      // Use preloaded audio for instant playback if available
+      if (preloadedResource && preloadedFfmpeg && !preloadedFfmpeg.killed) {
+        console.log(`[Bot ${botNum}] Using preloaded audio for instant playback...`);
+        const resource = preloadedResource;
+        currentFfmpeg = preloadedFfmpeg;
+        preloadedFfmpeg = null;
+        preloadedResource = null;
+        
+        // Schedule playback at synchronized time
+        setTimeout(() => {
+          console.log(`[Bot ${botNum}] Starting playback...`);
+          try {
+            stopRequested = false;
+            audioPlayCount = 0;
+            setupPlayer();
+            player.play(resource);
+            console.log(`[Bot ${botNum}] Playback started ✅`);
+          } catch (err) {
+            console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
+          }
+        }, delay);
+        
+        return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
+      }
+
+      // Fallback: spawn ffmpeg if no preloaded audio
       console.log(`[Bot ${botNum}] Starting ffmpeg...`);
       const ffmpeg = spawnFfmpeg();
       if (!ffmpeg) {
