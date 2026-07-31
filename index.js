@@ -131,8 +131,8 @@ tokens.forEach((token, index) => {
   let currentFfmpeg = null;
   let currentResource = null;
 
-  // Use MP3 files (tracked by git, deployed on Render)
-  const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+  // Use the new compressed audio file for all bots
+  const audioPath = path.join(__dirname, 'V.2 DARK BOOGEYMAN 4LUVONTOP (1)_compressed.mp3');
 
   // ========== AUDIO SYSTEM ==========
   
