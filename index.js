@@ -17,7 +17,7 @@ const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
 const ffmpegPath = require('ffmpeg-static');
 
-// Ensure ffmpeg is accessible for prism-media fallback
+// Ensure ffmpeg is accessible
 if (ffmpegPath) {
   process.env.FFMPEG_PATH = ffmpegPath;
 }
@@ -126,100 +126,100 @@ tokens.forEach((token, index) => {
   let isJoining = false;
   let audioPlayCount = 0;
   let maxAudioPlays = 10;
-  let playbackTimeout = null;
   let currentFfmpeg = null;
-  let currentResource = null;
 
-  // Use PCM files - they are pre-converted and already in the correct format
+  // Use PCM files (pre-converted)
   const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
+
+  // ========== CLEANUP ==========
+  
+  const killFfmpeg = () => {
+    if (currentFfmpeg) {
+      try { 
+        currentFfmpeg.kill('SIGKILL'); 
+        console.log(`[Bot ${botNum}] FFmpeg killed`);
+      } catch (e) {}
+      currentFfmpeg = null;
+    }
+  };
+
+  const stopPlayer = () => {
+    if (player) {
+      try { player.stop(true); } catch (e) {}
+      player.removeAllListeners();
+      player = null;
+    }
+  };
 
   // ========== AUDIO SYSTEM ==========
 
-  // Creates a fresh audio resource by spawning ffmpeg to transcode PCM to Opus
-  // This is the most reliable approach for Discord voice
   const createResource = () => {
     if (!fs.existsSync(audioPath)) {
       console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
       return null;
     }
 
-    // Kill any existing ffmpeg process
-    if (currentFfmpeg) {
-      try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
-      currentFfmpeg = null;
-    }
+    killFfmpeg();
 
-    // Spawn ffmpeg: read PCM file -> encode to Opus -> pipe to stdout
-    // Using libopus encoder directly for best quality and compatibility
+    console.log(`[Bot ${botNum}] Spawning ffmpeg...`);
+    
     const ffmpeg = spawn(ffmpegPath, [
       '-y',
-      '-f', 's16le',        // Input format: signed 16-bit little-endian PCM
-      '-ar', '48000',        // Input sample rate: 48kHz
-      '-ac', '2',            // Input channels: stereo
-      '-i', audioPath,       // Input file
-      '-c:a', 'libopus',     // Encode to Opus
-      '-b:a', '96k',         // Bitrate: 96kbps (good quality)
-      '-ar', '48000',        // Output sample rate: 48kHz
-      '-ac', '2',            // Output channels: stereo
-      '-f', 'ogg',           // Output format: Ogg container
-      '-frame_duration', '20', // 20ms frames (standard for Discord)
-      '-packet_loss', '1',   // Enable packet loss concealment
-      '-application', 'audio', // Optimize for audio
-      '-vbr', 'on',          // Variable bitrate
-      'pipe:1'               // Output to stdout
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      '-i', audioPath,
+      '-c:a', 'libopus',
+      '-b:a', '96k',
+      '-ar', '48000',
+      '-ac', '2',
+      '-f', 'ogg',
+      '-frame_duration', '20',
+      '-packet_loss', '1',
+      '-application', 'audio',
+      '-vbr', 'on',
+      'pipe:1'
     ], {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
+    currentFfmpeg = ffmpeg;
+
     ffmpeg.on('error', (err) => {
       console.error(`[Bot ${botNum}] FFmpeg error:`, err.message);
+      killFfmpeg();
     });
 
-    ffmpeg.stderr.on('data', () => {
-      // ffmpeg diagnostic logs go to stderr - ignore for now
+    ffmpeg.on('exit', (code) => {
+      if (code !== 0) {
+        console.error(`[Bot ${botNum}] FFmpeg exited with code ${code}`);
+      }
+      if (currentFfmpeg === ffmpeg) {
+        currentFfmpeg = null;
+      }
     });
 
-    // Create a PassThrough to buffer the ffmpeg output
-    // This prevents backpressure issues
+    // Buffer ffmpeg output through PassThrough
     const passThrough = new PassThrough();
     ffmpeg.stdout.pipe(passThrough);
 
-    // Create the audio resource from the Ogg/Opus stream
     const resource = createAudioResource(passThrough, {
       inputType: StreamType.OggOpus,
       inlineVolume: true
     });
 
-    // Store references for cleanup
-    currentFfmpeg = ffmpeg;
-    currentResource = resource;
-
-    // Cleanup handlers
     resource.on('end', () => {
       console.log(`[Bot ${botNum}] Resource ended`);
-      cleanupFfmpeg();
+      if (currentFfmpeg === ffmpeg) {
+        killFfmpeg();
+      }
     });
 
     resource.on('error', (err) => {
       console.error(`[Bot ${botNum}] Resource error:`, err.message);
-      cleanupFfmpeg();
-    });
-
-    // Cleanup ffmpeg when resource is done
-    const cleanupFfmpeg = () => {
-      if (currentFfmpeg) {
-        try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
-        currentFfmpeg = null;
+      if (currentFfmpeg === ffmpeg) {
+        killFfmpeg();
       }
-      currentResource = null;
-    };
-
-    // Cleanup on process exit
-    ffmpeg.on('exit', (code) => {
-      if (code !== 0) {
-        console.error(`[Bot ${botNum}] FFmpeg exited with code ${code}`);
-      }
-      currentFfmpeg = null;
     });
 
     return resource;
@@ -230,12 +230,13 @@ tokens.forEach((token, index) => {
       try { player.stop(true); } catch (e) {}
       player.removeAllListeners();
     }
+    
     player = createAudioPlayer();
     
     player.on('error', err => {
       console.error(`[Bot ${botNum}] Player error:`, err.message);
       if (!stopRequested) {
-        cleanupFfmpeg();
+        killFfmpeg();
         setTimeout(() => playTrack(), 1000);
       }
     });
@@ -243,20 +244,14 @@ tokens.forEach((token, index) => {
     player.on('stateChange', (oldState, newState) => {
       console.log(`[Bot ${botNum}] Player: ${oldState.status} -> ${newState.status}`);
       if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
-        cleanupFfmpeg();
+        killFfmpeg();
         setTimeout(() => playTrack(), 100);
       }
     });
     
-    connection.subscribe(player);
-  };
-
-  const cleanupFfmpeg = () => {
-    if (currentFfmpeg) {
-      try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
-      currentFfmpeg = null;
+    if (connection) {
+      connection.subscribe(player);
     }
-    currentResource = null;
   };
 
   const playTrack = () => {
@@ -281,7 +276,11 @@ tokens.forEach((token, index) => {
       return;
     }
 
-    player.play(resource);
+    if (player) {
+      player.play(resource);
+    } else {
+      console.error(`[Bot ${botNum}] No player to play resource`);
+    }
   };
 
   const startPlayback = () => {
@@ -298,12 +297,8 @@ tokens.forEach((token, index) => {
   const stopPlayback = () => {
     stopRequested = true;
     audioPlayCount = 0;
-    cleanupFfmpeg();
-    if (player) {
-      try { player.stop(true); } catch (e) {}
-      player.removeAllListeners();
-      player = null;
-    }
+    killFfmpeg();
+    stopPlayer();
   };
 
   const safeDestroy = (conn) => {
@@ -335,7 +330,6 @@ tokens.forEach((token, index) => {
 
       connection.on('error', err => {
         console.error(`[Bot ${botNum}] Connection error:`, err?.message || err);
-        try { safeDestroy(connection); } catch (e) {}
       });
       
       connection.on(VoiceConnectionStatus.Ready, () => {
@@ -345,7 +339,6 @@ tokens.forEach((token, index) => {
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
         console.log(`[Bot ${botNum}] Disconnected`);
         stopPlayback();
-        // Auto-reconnect logic could be added here
       });
       
       connection.on(VoiceConnectionStatus.Destroyed, () => {
@@ -506,7 +499,6 @@ tokens.forEach((token, index) => {
             });
             connection.on('error', err => {
               console.error(`[Bot ${botNum}] AUTO VOICE CONNECTION ERROR:`, err?.message || err);
-              try { safeDestroy(connection); } catch (e) {}
             });
             console.log(`[Bot ${botNum}] AUTO JOINED channel ${envChannel}`);
             try {
