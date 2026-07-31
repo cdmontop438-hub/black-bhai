@@ -496,7 +496,7 @@ tokens.forEach((token, index) => {
     stopRequested = false;
     audioPlayCount = 0;
     setupPlayer();
-    playTrack();
+    playTrack(true); // Use preloaded audio if available
   };
 
   const startPlaybackWithResource = (resource) => {
@@ -685,15 +685,22 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Create resource and start playback at synchronized time
+      // Create audio resource immediately so ffmpeg starts producing data
+      let resource;
+      try {
+        resource = createAudioResource(ffmpeg.stdout, {
+          inputType: StreamType.OggOpus,
+          inlineVolume: true
+        });
+      } catch (err) {
+        console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
+        return reply('❌ Failed to create audio resource.');
+      }
+
+      // Start playback at synchronized time
       setTimeout(() => {
-        console.log(`[Bot ${botNum}] Creating resource and starting playback...`);
+        console.log(`[Bot ${botNum}] Starting playback...`);
         try {
-          const resource = createAudioResource(ffmpeg.stdout, {
-            inputType: StreamType.OggOpus,
-            inlineVolume: true
-          });
-          
           stopRequested = false;
           audioPlayCount = 0;
           setupPlayer();
