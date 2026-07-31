@@ -166,9 +166,16 @@ tokens.forEach((token, index) => {
     console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
 
     try {
+      // Verify file exists before creating stream
+      if (!fs.existsSync(audioPath)) {
+        console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
+        return;
+      }
+      
       // Create a FRESH resource every time — old resource becomes unreadable after one play
       const stream = fs.createReadStream(audioPath);
-      const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+      // FIXED: Use StreamType.Unknown for MP3 files - discord.js will auto-detect and transcode via ffmpeg
+      const resource = createAudioResource(stream, { inputType: StreamType.Unknown });
       player.play(resource);
     } catch (err) {
       console.error(`[Bot ${botNum}] playTrack error:`, err?.message || err);
