@@ -13,10 +13,11 @@ const {
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const { spawn } = require('child_process');
+const { PassThrough } = require('stream');
 const ffmpegPath = require('ffmpeg-static');
 
-// 🛠️ FIXED: Tell prism-media (used internally by @discordjs/voice) where to find ffmpeg
-// Without this, StreamType.Arbitrary conversion may fail silently on Render
+// Ensure ffmpeg is accessible for prism-media fallback
 if (ffmpegPath) {
   process.env.FFMPEG_PATH = ffmpegPath;
 }
@@ -126,96 +127,183 @@ tokens.forEach((token, index) => {
   let audioPlayCount = 0;
   let maxAudioPlays = 10;
   let playbackTimeout = null;
-  let currentStream = null;
+  let currentFfmpeg = null;
+  let currentResource = null;
 
-  // FIXED: Use pre-converted PCM files for reliable playback
+  // Use PCM files - they are pre-converted and already in the correct format
   const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
 
-  // 🛠️ FIXED: Setup player once with event listeners
-  // subscribe() is called BEFORE play() — correct order
-  // Error retries after 1 second, Idle creates fresh resource and loops
+  // ========== AUDIO SYSTEM ==========
+
+  // Creates a fresh audio resource by spawning ffmpeg to transcode PCM to Opus
+  // This is the most reliable approach for Discord voice
+  const createResource = () => {
+    if (!fs.existsSync(audioPath)) {
+      console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
+      return null;
+    }
+
+    // Kill any existing ffmpeg process
+    if (currentFfmpeg) {
+      try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
+      currentFfmpeg = null;
+    }
+
+    // Spawn ffmpeg: read PCM file -> encode to Opus -> pipe to stdout
+    // Using libopus encoder directly for best quality and compatibility
+    const ffmpeg = spawn(ffmpegPath, [
+      '-y',
+      '-f', 's16le',        // Input format: signed 16-bit little-endian PCM
+      '-ar', '48000',        // Input sample rate: 48kHz
+      '-ac', '2',            // Input channels: stereo
+      '-i', audioPath,       // Input file
+      '-c:a', 'libopus',     // Encode to Opus
+      '-b:a', '96k',         // Bitrate: 96kbps (good quality)
+      '-ar', '48000',        // Output sample rate: 48kHz
+      '-ac', '2',            // Output channels: stereo
+      '-f', 'ogg',           // Output format: Ogg container
+      '-frame_duration', '20', // 20ms frames (standard for Discord)
+      '-packet_loss', '1',   // Enable packet loss concealment
+      '-application', 'audio', // Optimize for audio
+      '-vbr', 'on',          // Variable bitrate
+      'pipe:1'               // Output to stdout
+    ], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    ffmpeg.on('error', (err) => {
+      console.error(`[Bot ${botNum}] FFmpeg error:`, err.message);
+    });
+
+    ffmpeg.stderr.on('data', () => {
+      // ffmpeg diagnostic logs go to stderr - ignore for now
+    });
+
+    // Create a PassThrough to buffer the ffmpeg output
+    // This prevents backpressure issues
+    const passThrough = new PassThrough();
+    ffmpeg.stdout.pipe(passThrough);
+
+    // Create the audio resource from the Ogg/Opus stream
+    const resource = createAudioResource(passThrough, {
+      inputType: StreamType.OggOpus,
+      inlineVolume: true
+    });
+
+    // Store references for cleanup
+    currentFfmpeg = ffmpeg;
+    currentResource = resource;
+
+    // Cleanup handlers
+    resource.on('end', () => {
+      console.log(`[Bot ${botNum}] Resource ended`);
+      cleanupFfmpeg();
+    });
+
+    resource.on('error', (err) => {
+      console.error(`[Bot ${botNum}] Resource error:`, err.message);
+      cleanupFfmpeg();
+    });
+
+    // Cleanup ffmpeg when resource is done
+    const cleanupFfmpeg = () => {
+      if (currentFfmpeg) {
+        try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
+        currentFfmpeg = null;
+      }
+      currentResource = null;
+    };
+
+    // Cleanup on process exit
+    ffmpeg.on('exit', (code) => {
+      if (code !== 0) {
+        console.error(`[Bot ${botNum}] FFmpeg exited with code ${code}`);
+      }
+      currentFfmpeg = null;
+    });
+
+    return resource;
+  };
+
   const setupPlayer = () => {
     if (player) {
       try { player.stop(true); } catch (e) {}
       player.removeAllListeners();
     }
     player = createAudioPlayer();
+    
     player.on('error', err => {
-      console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message);
+      console.error(`[Bot ${botNum}] Player error:`, err.message);
       if (!stopRequested) {
+        cleanupFfmpeg();
         setTimeout(() => playTrack(), 1000);
       }
     });
-    player.on('stateChange', (o, n) => {
-      console.log(`[Bot ${botNum}] PLAYER STATE: ${o.status} -> ${n.status}`);
-      if (n.status === AudioPlayerStatus.Idle && !stopRequested) {
-        // 🛠️ FIXED: Always create fresh resource on Idle and replay
+    
+    player.on('stateChange', (oldState, newState) => {
+      console.log(`[Bot ${botNum}] Player: ${oldState.status} -> ${newState.status}`);
+      if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
+        cleanupFfmpeg();
         setTimeout(() => playTrack(), 100);
       }
     });
-    // Subscribe BEFORE playing — critical for audio to reach Discord
+    
     connection.subscribe(player);
   };
 
-  // 🛠️ FIXED: Creates a fresh resource each time, then plays it on the existing player
+  const cleanupFfmpeg = () => {
+    if (currentFfmpeg) {
+      try { currentFfmpeg.kill('SIGKILL'); } catch (e) {}
+      currentFfmpeg = null;
+    }
+    currentResource = null;
+  };
+
   const playTrack = () => {
     if (stopRequested) return;
     if (audioPlayCount >= maxAudioPlays) {
-      console.log(`[Bot ${botNum}] 🔥 BOOGEYMAN COMPLETE - ${maxAudioPlays} plays finished`);
+      console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
       return;
     }
     audioPlayCount++;
-    console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
+    console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
 
-    // Verify file exists before creating stream
     if (!fs.existsSync(audioPath)) {
       console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
       return;
     }
-    
-    // Close previous stream if exists
-    if (currentStream) {
-      try { currentStream.close(); } catch (e) {}
-      currentStream = null;
+
+    const resource = createResource();
+    if (!resource) {
+      if (!stopRequested) {
+        setTimeout(() => playTrack(), 1000);
+      }
+      return;
     }
-    
-    // FIXED: Create stream from PCM file with proper format specification
-    currentStream = fs.createReadStream(audioPath);
-    const resource = createAudioResource(currentStream, { 
-      inputType: StreamType.Raw,
-      inlineVolume: true,
-      sampleRate: 48000,
-      channelCount: 2
-    });
-    
-    // Keep stream alive until playback finishes
-    resource.on('end', () => {
-      if (currentStream) {
-        try { currentStream.close(); } catch (e) {}
-        currentStream = null;
-      }
-    });
-    
-    resource.on('error', (err) => {
-      console.error(`[Bot ${botNum}] Resource error:`, err.message);
-      if (currentStream) {
-        try { currentStream.close(); } catch (e) {}
-        currentStream = null;
-      }
-    });
-    
+
     player.play(resource);
   };
 
   const startPlayback = () => {
     if (!connection) {
-      console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
+      console.error(`[Bot ${botNum}] No connection`);
       return;
     }
     stopRequested = false;
     audioPlayCount = 0;
     setupPlayer();
     playTrack();
+  };
+
+  const stopPlayback = () => {
+    stopRequested = true;
+    audioPlayCount = 0;
+    cleanupFfmpeg();
+    if (player) {
+      try { player.stop(true); } catch (e) {}
+      player.removeAllListeners();
+      player = null;
+    }
   };
 
   const safeDestroy = (conn) => {
@@ -225,10 +313,10 @@ tokens.forEach((token, index) => {
       if (status && status !== VoiceConnectionStatus.Destroyed) {
         conn.destroy();
       }
-    } catch (e) {
-      // ignore double-destroy or other race errors
-    }
+    } catch (e) {}
   };
+
+  // ========== VOICE CONNECTION ==========
 
   const attemptJoinVoiceChannel = async (vc, guild, reply, attempt = 1) => {
     try {
@@ -246,48 +334,38 @@ tokens.forEach((token, index) => {
       });
 
       connection.on('error', err => {
-        console.error(`[Bot ${botNum}] VOICE CONNECTION ERROR:`, err?.message || err);
+        console.error(`[Bot ${botNum}] Connection error:`, err?.message || err);
         try { safeDestroy(connection); } catch (e) {}
       });
+      
       connection.on(VoiceConnectionStatus.Ready, () => {
-        console.log(`[Bot ${botNum}] VOICE READY`);
+        console.log(`[Bot ${botNum}] Voice ready`);
       });
-      connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
-        console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
-        stopRequested = true;
-        if (player) {
-          try { player.stop(true); } catch (e) {}
-          player.removeAllListeners();
-          player = null;
-        }
+      
+      connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        console.log(`[Bot ${botNum}] Disconnected`);
+        stopPlayback();
+        // Auto-reconnect logic could be added here
       });
+      
       connection.on(VoiceConnectionStatus.Destroyed, () => {
-        console.log(`[Bot ${botNum}] VOICE DESTROYED`);
-        stopRequested = true;
-        if (player) {
-          try { player.stop(true); } catch (e) {}
-          player.removeAllListeners();
-          player = null;
-        }
-      });
-      connection.on('stateChange', (oldState, newState) => {
-        console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
+        console.log(`[Bot ${botNum}] Destroyed`);
+        stopPlayback();
       });
 
       await entersState(connection, VoiceConnectionStatus.Ready, 25000);
-      console.log(`[Bot ${botNum}] JOINED ✅`);
+      console.log(`[Bot ${botNum}] Joined ✅`);
       await reply('✅ Joined your voice channel.');
     } catch (err) {
-      console.error(`[Bot ${botNum}] JOIN ERROR attempt ${attempt}:`, err?.message || err);
+      console.error(`[Bot ${botNum}] Join error (attempt ${attempt}):`, err?.message || err);
       safeDestroy(connection);
       connection = null;
       if (attempt < MAX_JOIN_RETRIES) {
         const retryDelay = 1500 * attempt;
-        console.log(`[Bot ${botNum}] Retrying join in ${retryDelay}ms (attempt ${attempt + 1}/${MAX_JOIN_RETRIES})`);
         await sleep(retryDelay);
         return attemptJoinVoiceChannel(vc, guild, reply, attempt + 1);
       }
-      await reply('❌ Failed to join voice channel after multiple attempts.');
+      await reply('❌ Failed to join after multiple attempts.');
     } finally {
       if (attempt === 1) {
         isJoining = false;
@@ -295,7 +373,8 @@ tokens.forEach((token, index) => {
     }
   };
 
-  // Parse allowed role IDs from env (comma-separated)
+  // ========== COMMANDS ==========
+
   const allowedRoleIds = (process.env.ALLOWED_ROLE_IDS || '')
     .split(',')
     .map(id => id.trim())
@@ -304,7 +383,6 @@ tokens.forEach((token, index) => {
   const handleBotCommand = async (commandName, reply, guild, member) => {
     if (!guild || !member) return reply('Command failed: missing guild or member data.');
 
-    // Access check: allow Administrators OR members with at least one allowed role
     const isAdmin = member.permissions.has('Administrator');
     const hasAllowedRole = allowedRoleIds.length > 0 &&
       allowedRoleIds.some(roleId => member.roles.cache.has(roleId));
@@ -321,27 +399,20 @@ tokens.forEach((token, index) => {
 
     if (commandName === 'bkva') {
       if (isJoining) return reply('Already joining...');
-
       const vc = member.voice.channel;
       if (!vc) return reply('You need to be in a voice channel first.');
-
       isJoining = true;
       enqueueJoinTask(async () => {
         await attemptJoinVoiceChannel(vc, guild, reply);
       });
-
       return;
     }
 
     if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
-
-      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
-      if (!fs.existsSync(botAudio)) {
-        return reply(`BOOGEYMAN PCM audio file ${botNum} not found.`);
+      if (!fs.existsSync(audioPath)) {
+        return reply(`Audio file not found for bot ${botNum}.`);
       }
-
-      // Align start time across bots for synchronized playback
       const startAt = getSharedChstStartTime();
       const delay = Math.max(100, startAt - Date.now());
       setTimeout(() => {
@@ -349,28 +420,16 @@ tokens.forEach((token, index) => {
           console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
         }
       }, delay);
-
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
 
     if (commandName === 'bksp') {
-      stopRequested = true;
-      audioPlayCount = 0;
-      if (player) {
-        try { player.stop(true); } catch (e) {}
-        player.removeAllListeners();
-        player = null;
-      }
+      stopPlayback();
       return reply('✅ Audio stopped.');
     }
 
     if (commandName === 'bklv') {
-      stopRequested = true;
-      if (player) {
-        try { player.stop(true); } catch (e) {}
-        player.removeAllListeners();
-        player = null;
-      }
+      stopPlayback();
       safeDestroy(connection);
       connection = null;
       return reply('✅ Left voice channel.');
@@ -379,15 +438,11 @@ tokens.forEach((token, index) => {
     if (commandName === 'status') {
       try {
         const connState = connection ? (connection.state && connection.state.status) : 'not connected';
-        const channelId = connection && connection.joinConfig ? connection.joinConfig.channelId : (connection && connection.joining ? connection.joining.channelId : 'none');
         const playerState = player ? (player.state && player.state.status) : 'no player';
-        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}`;
-        await reply(`
-
-${msg}
-`);
+        const msg = `Connection: ${connState}\nPlayer: ${playerState}`;
+        await reply(msg);
       } catch (e) {
-        console.error(`[Bot ${botNum}] STATUS CMD ERROR:`, e.message);
+        console.error(`[Bot ${botNum}] Status error:`, e.message);
         await reply('Failed to retrieve status.');
       }
       return;
@@ -395,6 +450,8 @@ ${msg}
 
     return reply('Unknown command.');
   };
+
+  // ========== CLIENT EVENTS ==========
 
   client.on('messageCreate', async message => {
     if (message.author.bot) return;
@@ -405,16 +462,14 @@ ${msg}
       if (botNum !== 1) return;
       try {
         await message.reply(text).catch(() => {});
-      } catch (err) {
-        // ignore reply error
-      }
+      } catch (err) {}
     };
 
     await handleBotCommand(content.slice(1), reply, message.guild, message.member);
   });
 
   client.on('ready', async () => {
-    console.log(`[Bot ${botNum}] ONLINE ✅`);
+    console.log(`[Bot ${botNum}] Online ✅`);
 
     try {
       if (client.application && client.application.commands && typeof client.application.commands.set === 'function') {
@@ -430,7 +485,7 @@ ${msg}
         console.log(`[Bot ${botNum}] Registered slash commands in ${guilds.size} guild(s)`);
       }
     } catch (err) {
-      console.error(`[Bot ${botNum}] SLASH COMMAND REGISTRATION FAILED: ${err.message}`);
+      console.error(`[Bot ${botNum}] Slash command registration failed: ${err.message}`);
     }
 
     // Auto-join and auto-start playback when environment variables are set.
@@ -466,9 +521,7 @@ ${msg}
           console.error(`[Bot ${botNum}] AUTO_JOIN error:`, e.message);
         }
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   });
 
   client.on('interactionCreate', async interaction => {
