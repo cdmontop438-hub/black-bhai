@@ -127,7 +127,7 @@ tokens.forEach((token, index) => {
   let maxAudioPlays = 10;
   let playbackTimeout = null;
 
-  // FIXED: Use PCM format for reliable playback - discord.js handles raw PCM natively
+  // FIXED: Use PCM format with StreamType.Raw for direct playback without transcoding
   const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
 
   // 🛠️ FIXED: Setup player once with event listeners
@@ -175,8 +175,14 @@ tokens.forEach((token, index) => {
       
       // Create a FRESH resource every time — old resource becomes unreadable after one play
       const stream = fs.createReadStream(audioPath);
-      // FIXED: Let discord.js auto-detect the format - works for MP3 and other formats
-      const resource = createAudioResource(stream);
+      // FIXED: Use StreamType.Raw for PCM files with explicit format metadata
+      // Discord requires 48kHz, 2 channels, 16-bit signed little-endian PCM
+      const resource = createAudioResource(stream, { 
+        inputType: StreamType.Raw,
+        inlineVolume: true,
+        sampleRate: 48000,
+        channelCount: 2
+      });
       player.play(resource);
     } catch (err) {
       console.error(`[Bot ${botNum}] playTrack error:`, err?.message || err);
