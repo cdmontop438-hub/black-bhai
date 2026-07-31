@@ -7,14 +7,13 @@ const {
   AudioPlayerStatus,
   entersState,
   VoiceConnectionStatus,
-  StreamType
+  StreamType,
+  demuxProbe
 } = require('@discordjs/voice');
 
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-const { spawnSync } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
 
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
 const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;
@@ -88,38 +87,6 @@ if (!tokens.length) {
 
 console.log(`Starting ${tokens.length} bots in NUCLEAR STACKED mode...`);
 
-// 🛠️ FIXED: Pre-convert all MP3 files to PCM at startup (synchronous, one-time)
-// This avoids real-time ffmpeg conversion which was too slow (0.5x speed)
-// PCM files are read directly from disk during playback — fast and reliable
-console.log('[PCM] Pre-converting MP3 files to PCM...');
-for (let i = 1; i <= 10; i++) {
-  const mp3Path = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${i}.mp3`);
-  const pcmPath = mp3Path.replace(/\.mp3$/i, '.pcm');
-  if (!fs.existsSync(mp3Path)) {
-    console.log(`[PCM] SKIP missing ${path.basename(mp3Path)}`);
-    continue;
-  }
-  if (fs.existsSync(pcmPath)) {
-    const stats = fs.statSync(pcmPath);
-    if (stats.size > 1024) {
-      console.log(`[PCM] EXISTS ${path.basename(pcmPath)} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-      continue;
-    }
-  }
-  console.log(`[PCM] Converting ${path.basename(mp3Path)} -> ${path.basename(pcmPath)}...`);
-  const result = spawnSync(ffmpegPath, [
-    '-y', '-i', mp3Path,
-    '-ar', '48000', '-ac', '2', '-f', 's16le', pcmPath
-  ], { stdio: 'pipe' });
-  if (result.status !== 0) {
-    console.error(`[PCM] FAILED to convert ${path.basename(mp3Path)}:`, result.stderr.toString().slice(-500));
-  } else {
-    const stats = fs.statSync(pcmPath);
-    console.log(`[PCM] OK ${path.basename(pcmPath)} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-  }
-}
-console.log('[PCM] Pre-conversion complete.');
-
 let sharedChstStartTime = 0;
 const getSharedChstStartTime = () => {
   if (sharedChstStartTime <= Date.now()) {
@@ -168,15 +135,15 @@ tokens.forEach((token, index) => {
     }
   };
 
-  // 🛠️ FIXED: Play pre-converted PCM files directly from disk
-  // No ffmpeg process needed during playback — avoids 0.5x speed bottleneck
+  // 🛠️ FIXED: Use @discordjs/voice's built-in demuxProbe to play MP3 files natively
+  // No ffmpeg piping, no PCM conversion, no huge files — just clean MP3 playback
   const startPlayback = async () => {
     if (!connection) {
       console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
       return;
     }
 
-    const pcmPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
+    const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
 
     stopRequested = false;
     audioPlayCount = 0;
@@ -193,9 +160,11 @@ tokens.forEach((token, index) => {
       console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
 
       try {
-        // Read pre-converted PCM file directly from disk
-        const stream = fs.createReadStream(pcmPath, { highWaterMark: 128 * 1024 });
-        const resource = createAudioResource(stream, { inputType: StreamType.Raw });
+        // 🛠️ FIXED: Use demuxProbe to detect audio format and create proper resource
+        // This is the recommended approach from @discordjs/voice documentation
+        const stream = fs.createReadStream(audioPath);
+        const probe = await demuxProbe(stream);
+        const resource = createAudioResource(probe.stream, { inputType: probe.type });
 
         cleanupPlayer();
         player = createAudioPlayer();
@@ -358,9 +327,9 @@ tokens.forEach((token, index) => {
     if (commandName === 'bkst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      const botPcm = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.pcm`);
-      if (!fs.existsSync(botPcm)) {
-        return reply(`BOOGEYMAN PCM file ${botNum} not found.`);
+      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+      if (!fs.existsSync(botAudio)) {
+        return reply(`BOOGEYMAN audio file ${botNum} not found.`);
       }
 
       // Align start time across bots for synchronized playback
