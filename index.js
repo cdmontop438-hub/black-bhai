@@ -646,7 +646,7 @@ tokens.forEach((token, index) => {
       const delay = Math.max(100, startAt - Date.now());
       console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
 
-      // Spawn ffmpeg immediately
+      // Spawn ffmpeg now so it's ready when playback starts
       console.log(`[Bot ${botNum}] Starting ffmpeg...`);
       const ffmpeg = spawnFfmpeg();
       if (!ffmpeg) {
@@ -655,27 +655,24 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Create resource immediately - the audio player will buffer automatically
-      try {
-        const resource = createAudioResource(ffmpeg.stdout, {
-          inputType: StreamType.OggOpus,
-          inlineVolume: true
-        });
-        currentResource = resource;
-        
-        // Schedule playback at synchronized time
-        setTimeout(() => {
-          console.log(`[Bot ${botNum}] Starting playback now...`);
-          try {
-            startPlaybackWithResource(resource);
-          } catch (err) {
-            console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
-          }
-        }, delay);
-      } catch (err) {
-        console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
-        return reply('❌ Failed to create audio resource.');
-      }
+      // Create resource and start playback at synchronized time
+      setTimeout(() => {
+        console.log(`[Bot ${botNum}] Creating resource and starting playback...`);
+        try {
+          const resource = createAudioResource(ffmpeg.stdout, {
+            inputType: StreamType.OggOpus,
+            inlineVolume: true
+          });
+          
+          stopRequested = false;
+          audioPlayCount = 0;
+          setupPlayer();
+          player.play(resource);
+          console.log(`[Bot ${botNum}] Playback started ✅`);
+        } catch (err) {
+          console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
+        }
+      }, delay);
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
