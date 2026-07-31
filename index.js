@@ -646,7 +646,7 @@ tokens.forEach((token, index) => {
       
       currentFfmpeg = ffmpeg;
 
-      // Wait for ffmpeg to produce initial data, then create resource
+      // Wait for ffmpeg to produce sufficient data, then create resource
       setTimeout(() => {
         console.log(`[Bot ${botNum}] Creating audio resource...`);
         let resource;
@@ -672,9 +672,9 @@ tokens.forEach((token, index) => {
           } catch (err) {
             console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
           }
-        }, 500); // Buffer for 500ms before playing
+        }, 1000); // Buffer for 1000ms before playing
         
-      }, 1500); // Wait 1500ms for ffmpeg to produce initial data
+      }, 2500); // Wait 2500ms for ffmpeg to produce initial data
       
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
