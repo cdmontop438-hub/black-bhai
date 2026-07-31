@@ -136,6 +136,46 @@ tokens.forEach((token, index) => {
   // Use the new compressed audio file for all bots
   const audioPath = path.join(__dirname, 'V.2 DARK BOOGEYMAN 4LUVONTOP (1)_compressed.mp3');
 
+  const spawnFfmpeg = () => {
+    if (!fs.existsSync(audioPath)) return null;
+    const ffmpeg = spawn(ffmpegPath, [
+      '-i', audioPath,
+      '-c:a', 'libopus',
+      '-b:a', '128k',
+      '-ar', '48000',
+      '-ac', '2',
+      '-f', 'ogg',
+      '-flush_packets', '1',
+      '-fflags', '+nobuffer+fastseek+flush_packets',
+      '-flags', '+global_header',
+      '-avoid_negative_ts', 'make_zero',
+      'pipe:1'
+    ], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+    return ffmpeg;
+  };
+
+  const waitForFfmpegReady = (ffmpeg, timeout = 3000) => {
+    return new Promise((resolve, reject) => {
+      if (!ffmpeg || ffmpeg.killed) {
+        return reject(new Error('FFmpeg not running'));
+      }
+      const timer = setTimeout(() => {
+        reject(new Error('FFmpeg ready timeout'));
+      }, timeout);
+      ffmpeg.stdout.once('data', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      ffmpeg.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  };
+
   // ========== AUDIO SYSTEM ==========
   
   // Kill any running ffmpeg process
@@ -208,13 +248,34 @@ tokens.forEach((token, index) => {
       return null;
     }
 
-    if (preloadedResource && preloadedFfmpeg) {
+    // Use preloaded audio if available
+    if (preloadedResource && preloadedFfmpeg && !preloadedFfmpeg.killed) {
       const resource = preloadedResource;
       currentFfmpeg = preloadedFfmpeg;
       currentResource = resource;
       preloadedFfmpeg = null;
       preloadedResource = null;
       return resource;
+    } else if (preloadedFfmpeg && preloadedFfmpeg.killed) {
+      preloadedFfmpeg = null;
+      preloadedResource = null;
+    }
+
+    // Use pre-spawned ffmpeg (from bkst command delay period)
+    if (currentFfmpeg && !currentFfmpeg.killed) {
+      const ffmpeg = currentFfmpeg;
+      try {
+        const resource = createAudioResource(ffmpeg.stdout, {
+          inputType: StreamType.OggOpus,
+          inlineVolume: true
+        });
+        currentResource = resource;
+        return resource;
+      } catch (err) {
+        console.error(`[Bot ${botNum}] Failed to create resource from pre-spawned ffmpeg:`, err.message);
+        killFfmpeg(ffmpeg);
+        currentFfmpeg = null;
+      }
     }
 
     killFfmpeg();
@@ -339,6 +400,45 @@ tokens.forEach((token, index) => {
     audioPlayCount = 0;
     setupPlayer();
     playTrack();
+  };
+
+  const startPlaybackWithResource = (resource) => {
+    if (!connection) {
+      console.error(`[Bot ${botNum}] startPlaybackWithResource: No connection`);
+      return;
+    }
+    
+    stopRequested = false;
+    audioPlayCount = 0;
+    setupPlayer();
+    
+    if (player && resource) {
+      player.play(resource);
+    } else {
+      console.error(`[Bot ${botNum}] No player or resource available`);
+    }
+  };
+
+  const playTrackWithResource = (resource) => {
+    if (stopRequested) return;
+    if (audioPlayCount >= maxAudioPlays) {
+      console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
+      return;
+    }
+    
+    audioPlayCount++;
+    console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
+
+    if (!resource) {
+      console.error(`[Bot ${botNum}] No resource provided`);
+      return;
+    }
+
+    if (player) {
+      player.play(resource);
+    } else {
+      console.error(`[Bot ${botNum}] No player available`);
+    }
   };
 
   const stopPlayback = () => {
@@ -478,14 +578,57 @@ tokens.forEach((token, index) => {
       const startAt = getSharedChstStartTime();
       const delay = Math.max(100, startAt - Date.now());
       console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
-      setTimeout(() => {
-        console.log(`[Bot ${botNum}] Starting playback now...`);
-        try { 
-          startPlayback(); 
+
+      // Spawn ffmpeg IMMEDIATELY so it's ready when scheduled
+      console.log(`[Bot ${botNum}] Starting ffmpeg immediately...`);
+      const ffmpeg = spawnFfmpeg();
+      if (!ffmpeg) {
+        return reply('❌ Failed to start audio processor.');
+      }
+      
+      currentFfmpeg = ffmpeg;
+
+      // Wait for ffmpeg to produce data
+      waitForFfmpegReady(ffmpeg, 5000).then(() => {
+        console.log(`[Bot ${botNum}] FFmpeg producing data ✅`);
+        
+        // Create audio resource now that ffmpeg is ready
+        try {
+          const resource = createAudioResource(ffmpeg.stdout, {
+            inputType: StreamType.OggOpus,
+            inlineVolume: true
+          });
+          currentResource = resource;
+          
+          // Schedule playback at the synchronized time
+          setTimeout(() => {
+            console.log(`[Bot ${botNum}] Starting playback now...`);
+            try {
+              startPlaybackWithResource(resource);
+            } catch (err) {
+              console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
+            }
+          }, Math.max(0, delay));
         } catch (err) {
-          console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err);
+          console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
         }
-      }, delay);
+      }).catch(err => {
+        console.error(`[Bot ${botNum}] FFmpeg ready failed:`, err.message);
+        // Try anyway as fallback
+        setTimeout(() => {
+          try {
+            const resource = createAudioResource(ffmpeg.stdout, {
+              inputType: StreamType.OggOpus,
+              inlineVolume: true
+            });
+            currentResource = resource;
+            startPlaybackWithResource(resource);
+          } catch (e) {
+            console.error(`[Bot ${botNum}] Fallback failed:`, e.message);
+          }
+        }, delay);
+      });
+      
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
 
