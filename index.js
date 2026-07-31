@@ -167,26 +167,53 @@ tokens.forEach((token, index) => {
     audioPlayCount++;
     console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays})`);
 
-    try {
-      // Verify file exists before creating stream
-      if (!fs.existsSync(audioPath)) {
-        console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
-        return;
-      }
-      
-      // FIXED: Use StreamType.Arbitrary for MP3 - prism-media will use ffmpeg to transcode
-      const stream = fs.createReadStream(audioPath);
-      const resource = createAudioResource(stream, { 
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true
-      });
-      player.play(resource);
-    } catch (err) {
-      console.error(`[Bot ${botNum}] playTrack error:`, err?.message || err);
+    // Verify file exists before creating stream
+    if (!fs.existsSync(audioPath)) {
+      console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
+      return;
+    }
+    
+    // FIXED: Manually spawn ffmpeg to transcode MP3 to PCM
+    // This ensures proper audio format for Discord
+    const ffmpeg = spawn(ffmpegPath, [
+      '-i', audioPath,
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      '-loglevel', 'quiet',
+      'pipe:1'
+    ], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    ffmpeg.on('error', (err) => {
+      console.error(`[Bot ${botNum}] FFmpeg spawn error:`, err.message);
       if (!stopRequested) {
         setTimeout(() => playTrack(), 1000);
       }
-    }
+    });
+
+    ffmpeg.stderr.on('data', () => {
+      // Ignore ffmpeg logs
+    });
+
+    // Create resource from ffmpeg stdout
+    const resource = createAudioResource(ffmpeg.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true
+    });
+
+    // Clean up ffmpeg when resource finishes
+    resource.on('end', () => {
+      try { ffmpeg.kill(); } catch (e) {}
+    });
+
+    resource.on('error', (err) => {
+      console.error(`[Bot ${botNum}] Resource error:`, err.message);
+      try { ffmpeg.kill(); } catch (e) {}
+    });
+
+    player.play(resource);
   };
 
   const startPlayback = () => {
