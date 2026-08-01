@@ -14,19 +14,12 @@ const path = require('path');
 const http = require('http');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const prism = require('prism-media');
 const ffmpegPath = require('ffmpeg-static');
 
-// Ensure ffmpeg is accessible for prism-media transcoding
-if (ffmpegPath) {
-  process.env.FFMPEG_PATH = ffmpegPath;
-  console.log(`[System] FFMPEG_PATH set to ${ffmpegPath}`);
-} else {
-  console.warn('[System] ffmpeg-static not found! Audio transcoding may fail.');
-}
-
 const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
-const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 300;
-const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 3;
+const JOIN_STAGGER_MS = process.env.JOIN_STAGGER_MS ? parseInt(process.env.JOIN_STAGGER_MS, 10) : 0;
+const JOIN_CONCURRENCY = process.env.JOIN_CONCURRENCY ? parseInt(process.env.JOIN_CONCURRENCY, 10) : 10;
 const joinQueue = [];
 const activeJoinTasks = new Set();
 let joinQueueProcessing = false;
@@ -59,8 +52,8 @@ const enqueueJoinTask = (task) => {
   }
 };
 
-require('opusscript');
-require('libsodium-wrappers');
+// Use @discordjs/opus for voice encoding instead of opusscript for better performance.
+// libsodium-wrappers is not needed explicitly unless you use custom encryption logic.
 
 // Health check
 const PORT = process.env.PORT || 8080;
@@ -79,6 +72,7 @@ healthServer.on('error', err => {
 
 healthServer.listen(PORT, () => {
   console.log(`[Health] Listening on port ${PORT}`);
+  console.log(`[System] Join config: ${JOIN_CONCURRENCY} concurrency, ${JOIN_STAGGER_MS}ms stagger`);
 });
 
 const tokens = Object.entries(process.env)
@@ -93,6 +87,182 @@ const tokens = Object.entries(process.env)
 if (!tokens.length) {
   throw new Error('No TOKEN environment variables found. Please set TOKEN1, TOKEN2, ...');
 }
+
+let sharedPlayer = null;
+let playbackStarting = false;
+let playbackStarted = false;
+let playbackQueued = false;
+const botInstances = [];
+
+const createSharedPlayer = () => {
+  if (sharedPlayer) return sharedPlayer;
+  sharedPlayer = createAudioPlayer();
+
+  sharedPlayer.on('error', err => {
+    console.error('[Shared Player] Error:', err.message || err);
+  });
+
+  sharedPlayer.on('stateChange', (oldState, newState) => {
+    if (newState.status === AudioPlayerStatus.Playing) {
+      console.log('[Shared Player] Audio is now playing');
+    } else if (newState.status === AudioPlayerStatus.Idle) {
+      console.log('[Shared Player] Audio player is idle');
+    }
+  });
+
+  return sharedPlayer;
+};
+
+const subscribeConnectionToSharedPlayer = (bot) => {
+  const conn = bot.getConnection();
+  if (!conn || conn.state?.status !== VoiceConnectionStatus.Ready) {
+    console.warn(`[Bot ${bot.botNum}] Cannot subscribe to shared player: connection not ready`);
+    return null;
+  }
+
+  if (bot.getSubscription()) {
+    return bot.getSubscription();
+  }
+
+  const player = createSharedPlayer();
+  const subscription = conn.subscribe(player);
+  if (!subscription) {
+    console.warn(`[Bot ${bot.botNum}] Shared player subscription returned null`);
+    return null;
+  }
+
+  console.log(`[Bot ${bot.botNum}] Subscribed to shared player`);
+  bot.setSubscription(subscription);
+  return subscription;
+};
+
+const waitForReadyConnections = async (bots, timeoutMs = 15000) => {
+  const readyPromises = bots.map(bot => {
+    const conn = bot.getConnection();
+    if (!conn) return Promise.resolve(false);
+    if (conn.state?.status === VoiceConnectionStatus.Ready) return Promise.resolve(true);
+    return entersState(conn, VoiceConnectionStatus.Ready, timeoutMs)
+      .then(() => true)
+      .catch(() => false);
+  });
+
+  const results = await Promise.all(readyPromises);
+  return bots.filter((_, index) => results[index]);
+};
+
+const queueSharedPlayback = () => {
+  if (!playbackQueued) {
+    playbackQueued = true;
+    console.log('[Shared Player] Playback queued until all connected bots are ready');
+  }
+};
+
+const checkPlaybackQueue = async () => {
+  if (!playbackQueued || playbackStarted || playbackStarting) return;
+
+  const connectedBots = botInstances.filter(bot => bot.getConnection());
+  if (!connectedBots.length) return;
+
+  const readyBots = connectedBots.filter(bot => bot.getConnection().state?.status === VoiceConnectionStatus.Ready);
+  if (!readyBots.length) return;
+
+  playbackQueued = false;
+  console.log('[Shared Player] One or more connected bots are ready; auto-starting queued playback');
+  await startSharedPlayback();
+};
+
+const createAudioResourceFromFile = (audioPath) => {
+  if (!fs.existsSync(audioPath)) {
+    throw new Error(`Audio file not found: ${audioPath}`);
+  }
+
+  console.log('[Shared Player] Creating audio resource from file:', audioPath);
+  console.log('[Shared Player] Using ffmpeg executable:', ffmpegPath);
+
+  const ffmpeg = spawn(ffmpegPath, [
+    '-hide_banner',
+    '-loglevel', 'error',
+    '-i', audioPath,
+    '-ac', '2',
+    '-ar', '48000',
+    '-f', 's16le',
+    'pipe:1'
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  ffmpeg.stderr.on('data', data => {
+    console.error('[Shared Player] FFmpeg stderr:', data.toString());
+  });
+
+  ffmpeg.on('error', err => {
+    console.error('[Shared Player] FFmpeg spawn error:', err?.message || err);
+  });
+
+  const opusEncoder = new prism.opus.Encoder({
+    rate: 48000,
+    channels: 2,
+    frameSize: 960
+  });
+
+  ffmpeg.stdout.on('error', err => {
+    console.error('[Shared Player] FFmpeg stdout error:', err?.message || err);
+  });
+
+  opusEncoder.on('error', err => {
+    console.error('[Shared Player] Opus encoder error:', err?.message || err);
+  });
+
+  const resource = createAudioResource(ffmpeg.stdout.pipe(opusEncoder), {
+    inlineVolume: true,
+    inputType: StreamType.Opus
+  });
+
+  if (resource.playStream && typeof resource.playStream.on === 'function') {
+    resource.playStream.on('error', err => {
+      console.error('[Shared Player] Resource playStream error:', err?.message || err);
+    });
+    resource.playStream.on('end', () => {
+      console.log('[Shared Player] Resource playStream ended');
+    });
+  }
+
+  return resource;
+};
+
+const playSharedAudio = async (audioPath) => {
+  try {
+    const player = createSharedPlayer();
+    const resource = createAudioResourceFromFile(audioPath);
+    resource.volume?.setVolume(1.0);
+
+    player.play(resource);
+    console.log('[Shared Player] Started playback');
+    return true;
+  } catch (err) {
+    console.error('[Shared Player] Playback failed:', err.message || err);
+    return false;
+  }
+};
+
+const stopSharedAudio = () => {
+  if (!sharedPlayer) return;
+  try {
+    sharedPlayer.stop(true);
+  } catch (err) {
+    console.error('[Shared Player] Stop failed:', err.message || err);
+  }
+
+  botInstances.forEach(bot => {
+    const sub = bot.getSubscription();
+    if (sub) {
+      try { sub.unsubscribe(); } catch (e) {}
+      bot.setSubscription(null);
+    }
+  });
+
+  sharedPlayer = null;
+  playbackStarted = false;
+  playbackStarting = false;
+};
 
 console.log(`Starting ${tokens.length} bots in NUCLEAR STACKED mode...`);
 
@@ -123,396 +293,86 @@ tokens.forEach((token, index) => {
   ];
 
   let connection;
-  let player;
-  let stopRequested = false;
+  let subscription = null;
   let isJoining = false;
-  let audioPlayCount = 0;
-  let maxAudioPlays = 10;
-  let currentFfmpeg = null;
-  let currentResource = null;
-  let preloadedFfmpeg = null;
-  let preloadedResource = null;
-  let pendingFfmpeg = null; // For bkst command pre-spawned ffmpeg
+  let lastVoiceChannelId = null;
+  let lastGuildId = null;
 
-   // Use separate audio file for each bot
-   const audioPath = path.join(__dirname, `audio${botNum}.mp3`);
-
-  const spawnFfmpeg = () => {
-    if (!fs.existsSync(audioPath)) return null;
-    const ffmpeg = spawn(ffmpegPath, [
-      '-i', audioPath,
-      '-c:a', 'libopus',
-      '-b:a', '128k',
-      '-ar', '48000',
-      '-ac', '2',
-      '-f', 'ogg',
-      '-flush_packets', '1',
-      '-fflags', '+nobuffer+fastseek+flush_packets',
-      '-flags', '+global_header',
-      '-avoid_negative_ts', 'make_zero',
-      'pipe:1'
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true
-    });
-    return ffmpeg;
+  const botInstance = {
+    botNum,
+    getConnection: () => connection,
+    setConnection: (conn) => { connection = conn; },
+    getSubscription: () => subscription,
+    setSubscription: (sub) => { subscription = sub; }
   };
+  botInstances.push(botInstance);
+
+   // Use separate audio file for each bot (but shared playback uses one file path)
+   const audioPath = path.join(__dirname, `audio${botNum}.mp3`);
+   const sharedAudioPath = path.join(__dirname, 'audio1.mp3');
 
   // ========== AUDIO SYSTEM ==========
-  
-  // Kill any running ffmpeg process
-  const killFfmpeg = (ffmpeg = currentFfmpeg) => {
-    if (ffmpeg) {
-      try { ffmpeg.kill('SIGKILL'); } catch (e) {}
-    }
-  };
 
-  // Pre-load audio for instant playback
-  const preloadAudio = async () => {
-    if (!fs.existsSync(audioPath)) {
-      console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
-      return false;
+  const startSharedPlayback = async () => {
+    if (playbackStarted || playbackStarting) {
+      console.log(`[Bot ${botNum}] Shared playback already active or starting`);
+      return playbackStarted;
     }
 
+    playbackStarting = true;
     try {
-      console.log(`[Bot ${botNum}] Pre-loading audio...`);
-      const ffmpeg = spawn(ffmpegPath, [
-        '-i', audioPath,
-        '-c:a', 'libopus',
-        '-b:a', '128k',
-        '-ar', '48000',
-        '-ac', '2',
-        '-f', 'ogg',
-        '-flush_packets', '1',
-        '-fflags', '+nobuffer+fastseek+flush_packets',
-        '-flags', '+global_header',
-        '-avoid_negative_ts', 'make_zero',
-        'pipe:1'
-      ], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true
-      });
+      if (!fs.existsSync(sharedAudioPath)) {
+        console.error(`[Bot ${botNum}] Shared audio file not found: ${sharedAudioPath}`);
+        return false;
+      }
 
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('Preload timeout'));
-        }, 5000);
+      const connectedBots = botInstances.filter(bot => bot.getConnection());
+      if (!connectedBots.length) {
+        console.warn(`[Bot ${botNum}] No bot voice connections available for shared playback`);
+        return false;
+      }
 
-        ffmpeg.stdout.once('data', () => {
-          clearTimeout(timeout);
-          resolve();
-        });
+      const readyBots = await waitForReadyConnections(connectedBots, 15000);
+      if (readyBots.length === 0) {
+        console.warn(`[Bot ${botNum}] No ready bot connections available for playback. Playback will be queued.`);
+        queueSharedPlayback();
+        return false;
+      }
 
-        ffmpeg.on('error', (err) => {
-          clearTimeout(timeout);
-          reject(err);
-        });
-      });
+      if (readyBots.length !== connectedBots.length) {
+        const notReady = connectedBots.length - readyBots.length;
+        console.warn(`[Bot ${botNum}] ${notReady} connected bot(s) are not ready yet. Starting playback on ${readyBots.length} ready bot(s).`);
+      }
 
-      const resource = createAudioResource(ffmpeg.stdout, {
-        inputType: StreamType.OggOpus,
-        inlineVolume: true
-      });
+      readyBots.forEach(bot => subscribeConnectionToSharedPlayer(bot));
+      console.log(`[Bot ${botNum}] Shared audio subscribed ${readyBots.length} bots before playback`);
 
-      preloadedFfmpeg = ffmpeg;
-      preloadedResource = resource;
-      console.log(`[Bot ${botNum}] Audio pre-loaded ✅`);
+      const player = createSharedPlayer();
+      const resource = createAudioResourceFromFile(sharedAudioPath);
+      resource.volume?.setVolume(1.0);
+
+      player.play(resource);
+      console.log(`[Bot ${botNum}] Shared audio resource playing from ${sharedAudioPath}`);
+
+      playbackStarted = true;
       return true;
     } catch (err) {
-      console.error(`[Bot ${botNum}] Preload failed:`, err.message);
+      console.error(`[Bot ${botNum}] Shared playback failed:`, err.message || err);
       return false;
-    }
-  };
-
-  const createOptimizedResource = () => {
-    if (!fs.existsSync(audioPath)) {
-      console.error(`[Bot ${botNum}] Audio file NOT FOUND: ${audioPath}`);
-      return null;
-    }
-
-    // Use preloaded audio if available
-    if (preloadedResource && preloadedFfmpeg && !preloadedFfmpeg.killed) {
-      const resource = preloadedResource;
-      currentFfmpeg = preloadedFfmpeg;
-      currentResource = resource;
-      preloadedFfmpeg = null;
-      preloadedResource = null;
-      return resource;
-    } else if (preloadedFfmpeg && preloadedFfmpeg.killed) {
-      preloadedFfmpeg = null;
-      preloadedResource = null;
-    }
-
-    // Use pending ffmpeg (pre-spawned for next repeat)
-    if (pendingFfmpeg && !pendingFfmpeg.killed) {
-      const ffmpeg = pendingFfmpeg;
-      pendingFfmpeg = null;
-      currentFfmpeg = ffmpeg;
-      try {
-        const resource = createAudioResource(ffmpeg.stdout, {
-          inputType: StreamType.OggOpus,
-          inlineVolume: true
-        });
-        currentResource = resource;
-        return resource;
-      } catch (err) {
-        console.error(`[Bot ${botNum}] Failed to create resource from pending ffmpeg:`, err.message);
-        killFfmpeg(ffmpeg);
-        currentFfmpeg = null;
-      }
-    }
-
-    // Use current ffmpeg (from bkst command)
-    if (currentFfmpeg && !currentFfmpeg.killed) {
-      const ffmpeg = currentFfmpeg;
-      try {
-        const resource = createAudioResource(ffmpeg.stdout, {
-          inputType: StreamType.OggOpus,
-          inlineVolume: true
-        });
-        currentResource = resource;
-        return resource;
-      } catch (err) {
-        console.error(`[Bot ${botNum}] Failed to create resource from pre-spawned ffmpeg:`, err.message);
-        killFfmpeg(ffmpeg);
-        currentFfmpeg = null;
-      }
-    }
-
-    killFfmpeg();
-
-    const ffmpeg = spawn(ffmpegPath, [
-      '-i', audioPath,
-      '-c:a', 'libopus',
-      '-b:a', '128k',
-      '-ar', '48000',
-      '-ac', '2',
-      '-f', 'ogg',
-      '-flush_packets', '1',
-      '-fflags', '+nobuffer+fastseek+flush_packets',
-      '-flags', '+global_header',
-      '-avoid_negative_ts', 'make_zero',
-      'pipe:1'
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true
-    });
-
-    currentFfmpeg = ffmpeg;
-
-    let stderrData = '';
-    ffmpeg.stderr.on('data', (data) => {
-      stderrData += data.toString();
-    });
-
-    ffmpeg.on('error', (err) => {
-      console.error(`[Bot ${botNum}] FFmpeg error:`, err.message);
-      killFfmpeg();
-    });
-
-    ffmpeg.on('exit', (code, signal) => {
-      if (code !== 0) {
-        console.error(`[Bot ${botNum}] FFmpeg stderr: ${stderrData.slice(-500)}`);
-      }
-      if (currentFfmpeg === ffmpeg) currentFfmpeg = null;
-    });
-
-    let resource;
-    try {
-      resource = createAudioResource(ffmpeg.stdout, {
-        inputType: StreamType.OggOpus,
-        inlineVolume: true
-      });
-    } catch (err) {
-      console.error(`[Bot ${botNum}] createAudioResource failed:`, err.message);
-      killFfmpeg();
-      return null;
-    }
-
-    currentResource = resource;
-    return resource;
-  };
-
-  const setupPlayer = () => {
-    if (player) {
-      try { player.stop(true); } catch (e) {}
-      player.removeAllListeners();
-      player = null;
-    }
-    
-    player = createAudioPlayer();
-    
-    player.on('error', err => {
-      console.error(`[Bot ${botNum}] Player error:`, err.message);
-      killFfmpeg();
-      if (!stopRequested) {
-        setTimeout(() => playTrack(), 1000);
-      }
-    });
-    
-    player.on('stateChange', (oldState, newState) => {
-      if (newState.status === AudioPlayerStatus.Idle && !stopRequested) {
-        // Pre-spawn next ffmpeg BEFORE killing current one to avoid buffering
-        if (audioPlayCount < maxAudioPlays) {
-          const nextFfmpeg = spawnFfmpeg();
-          if (nextFfmpeg) {
-            pendingFfmpeg = nextFfmpeg;
-            console.log(`[Bot ${botNum}] Pre-spawned ffmpeg for next repeat`);
-          }
-        }
-        killFfmpeg();
-        if (audioPlayCount < maxAudioPlays) {
-          playTrack();
-        } else {
-          console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
-        }
-      }
-    });
-    
-    if (connection) {
-      connection.subscribe(player);
-    }
-  };
-
-  const playTrack = (usePreloaded = false) => {
-    if (stopRequested) return;
-    if (audioPlayCount >= maxAudioPlays) {
-      console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
-      return;
-    }
-    
-    audioPlayCount++;
-    console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
-
-    // Priority 1: Use preloaded resource (from bot ready event)
-    if (usePreloaded && preloadedResource && preloadedFfmpeg && !preloadedFfmpeg.killed) {
-      const resource = preloadedResource;
-      currentFfmpeg = preloadedFfmpeg;
-      preloadedFfmpeg = null;
-      preloadedResource = null;
-      
-      if (player) {
-        player.play(resource);
-      } else {
-        console.error(`[Bot ${botNum}] No player available`);
-      }
-      return;
-    }
-
-    // Priority 2: Use pending ffmpeg (pre-spawned for next repeat) - CHECK THIS FIRST
-    if (pendingFfmpeg && !pendingFfmpeg.killed) {
-      console.log(`[Bot ${botNum}] Using pre-spawned ffmpeg for repeat ${audioPlayCount}`);
-      currentFfmpeg = pendingFfmpeg;
-      pendingFfmpeg = null;
-      
-      const resource = createOptimizedResource();
-      if (resource) {
-        if (player) {
-          player.play(resource);
-        } else {
-          console.error(`[Bot ${botNum}] No player available`);
-        }
-        return;
-      }
-    }
-
-    // Priority 3: Use current ffmpeg (pre-spawned by bkst command)
-    if (currentFfmpeg && !currentFfmpeg.killed) {
-      const resource = createOptimizedResource();
-      if (resource) {
-        if (player) {
-          player.play(resource);
-        } else {
-          console.error(`[Bot ${botNum}] No player available`);
-        }
-        return;
-      }
-    }
-
-    // Priority 4: Spawn new ffmpeg if nothing available
-    console.log(`[Bot ${botNum}] Spawning new ffmpeg...`);
-    const ffmpeg = spawnFfmpeg();
-    if (!ffmpeg) {
-      console.error(`[Bot ${botNum}] Failed to spawn ffmpeg`);
-      setTimeout(() => playTrack(), 1000);
-      return;
-    }
-
-    currentFfmpeg = ffmpeg;
-    
-    // Wait for ffmpeg to buffer, then create resource
-    setTimeout(() => {
-      if (!stopRequested) {
-        playTrack();
-      }
-    }, 500);
-  };
-
-  const startPlayback = () => {
-    if (!connection) {
-      console.error(`[Bot ${botNum}] startPlayback: No connection`);
-      return;
-    }
-    
-    stopRequested = false;
-    audioPlayCount = 0;
-    setupPlayer();
-    playTrack(true); // Use preloaded audio if available
-  };
-
-  const startPlaybackWithResource = (resource) => {
-    if (!connection) {
-      console.error(`[Bot ${botNum}] startPlaybackWithResource: No connection`);
-      return;
-    }
-    
-    stopRequested = false;
-    audioPlayCount = 0;
-    setupPlayer();
-    
-    if (player && resource) {
-      player.play(resource);
-    } else {
-      console.error(`[Bot ${botNum}] No player or resource available`);
-    }
-  };
-
-  const playTrackWithResource = (resource) => {
-    if (stopRequested) return;
-    if (audioPlayCount >= maxAudioPlays) {
-      console.log(`[Bot ${botNum}] 🔥 COMPLETE - ${maxAudioPlays} plays finished`);
-      return;
-    }
-    
-    audioPlayCount++;
-    console.log(`[Bot ${botNum}] 🔊 Playing (${audioPlayCount}/${maxAudioPlays})`);
-
-    if (!resource) {
-      console.error(`[Bot ${botNum}] No resource provided`);
-      return;
-    }
-
-    if (player) {
-      player.play(resource);
-    } else {
-      console.error(`[Bot ${botNum}] No player available`);
+    } finally {
+      playbackStarting = false;
     }
   };
 
   const stopPlayback = () => {
     console.log(`[Bot ${botNum}] stopPlayback called`);
-    stopRequested = true;
-    audioPlayCount = 0;
-    if (player) {
-      try { player.stop(true); } catch (e) {}
-      player.removeAllListeners();
-      player = null;
-    }
+    stopSharedAudio();
   };
 
   const safeDestroy = (conn) => {
     try {
       if (!conn) return;
+      try { conn.removeAllListeners(); } catch (e) {}
       const status = conn.state?.status;
       if (status && status !== VoiceConnectionStatus.Destroyed) {
         conn.destroy();
@@ -525,6 +385,7 @@ tokens.forEach((token, index) => {
   const attemptJoinVoiceChannel = async (vc, guild, reply, attempt = 1) => {
     try {
       if (connection) {
+        try { connection.removeAllListeners(); } catch (e) {}
         safeDestroy(connection);
         connection = null;
       }
@@ -538,16 +399,26 @@ tokens.forEach((token, index) => {
         selfDeaf: true,
         group: client.user.id
       });
+      try { connection.setMaxListeners(30); } catch (e) {}
 
       connection.on('error', err => {
         console.error(`[Bot ${botNum}] Connection error:`, err?.message || err);
       });
-      
-      connection.on(VoiceConnectionStatus.Ready, () => {
-        console.log(`[Bot ${botNum}] Voice ready`);
+
+      connection.on(VoiceConnectionStatus.Signalling, () => {
+        console.log(`[Bot ${botNum}] Voice signalling`);
+      });
+
+      connection.on(VoiceConnectionStatus.Connecting, () => {
+        console.log(`[Bot ${botNum}] Voice connecting`);
       });
       
-      connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      connection.on(VoiceConnectionStatus.Ready, async () => {
+        console.log(`[Bot ${botNum}] Voice ready`);
+        await checkPlaybackQueue();
+      });
+      
+      connection.on(VoiceConnectionStatus.Disconnected, () => {
         console.log(`[Bot ${botNum}] Disconnected`);
         stopPlayback();
       });
@@ -557,7 +428,9 @@ tokens.forEach((token, index) => {
         stopPlayback();
       });
 
-      await entersState(connection, VoiceConnectionStatus.Ready, 25000);
+      if (connection.state?.status !== VoiceConnectionStatus.Ready) {
+        await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+      }
       console.log(`[Bot ${botNum}] Joined ✅`);
       await reply('✅ Joined your voice channel.');
     } catch (err) {
@@ -565,7 +438,7 @@ tokens.forEach((token, index) => {
       safeDestroy(connection);
       connection = null;
       if (attempt < MAX_JOIN_RETRIES) {
-        const retryDelay = 1500 * attempt;
+        const retryDelay = 800 * attempt;
         await sleep(retryDelay);
         return attemptJoinVoiceChannel(vc, guild, reply, attempt + 1);
       }
@@ -621,101 +494,25 @@ tokens.forEach((token, index) => {
     if (commandName === 'bkst') {
       console.log(`[Bot ${botNum}] bkst command: checking connection...`);
       if (!connection) {
-        console.log(`[Bot ${botNum}] bkst failed: no connection`);
-        return reply('Bot is not in a voice channel.');
+        return reply('❌ Bot is not in a voice channel. Use !bkva to join first.');
       }
       console.log(`[Bot ${botNum}] Connection status: ${connection.state?.status}`);
-      
-      console.log(`[Bot ${botNum}] bkst: checking audio file...`);
-      if (!fs.existsSync(audioPath)) {
-        console.error(`[Bot ${botNum}] Audio file not found: ${audioPath}`);
-        return reply(`Audio file ${botNum} not found.`);
-      }
-      console.log(`[Bot ${botNum}] Audio file OK: ${audioPath}`);
 
-      const startAt = getSharedChstStartTime();
-      const delay = Math.max(100, startAt - Date.now());
-      console.log(`[Bot ${botNum}] Scheduling playback in ${delay}ms`);
-
-      // Use preloaded audio for instant playback if available
-      if (preloadedResource && preloadedFfmpeg && !preloadedFfmpeg.killed) {
-        console.log(`[Bot ${botNum}] Using preloaded audio for instant playback...`);
-        const resource = preloadedResource;
-        currentFfmpeg = preloadedFfmpeg;
-        preloadedFfmpeg = null;
-        preloadedResource = null;
-        
-        // Schedule playback at synchronized time
-        setTimeout(() => {
-          console.log(`[Bot ${botNum}] Starting playback...`);
-          try {
-            stopRequested = false;
-            audioPlayCount = 0;
-            setupPlayer();
-            player.play(resource);
-            console.log(`[Bot ${botNum}] Playback started ✅`);
-          } catch (err) {
-            console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
-          }
-        }, delay);
-        
-        return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
-      }
-
-      // Fallback: spawn ffmpeg if no preloaded audio
-      console.log(`[Bot ${botNum}] Starting ffmpeg...`);
-      const ffmpeg = spawnFfmpeg();
-      if (!ffmpeg) {
-        return reply('❌ Failed to start audio processor.');
-      }
-      
-      currentFfmpeg = ffmpeg;
-
-      // Wait for ffmpeg to produce data before creating resource
-      const waitForData = new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          resolve(); // Resolve anyway after 2s
-        }, 2000);
-
-        ffmpeg.stdout.once('data', () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-
-        ffmpeg.on('error', (err) => {
-          clearTimeout(timeout);
-          resolve(); // Resolve anyway on error
-        });
-      });
-
-      waitForData.then(() => {
-        let resource;
+      if (connection.state?.status !== VoiceConnectionStatus.Ready) {
         try {
-          resource = createAudioResource(ffmpeg.stdout, {
-            inputType: StreamType.OggOpus,
-            inlineVolume: true
-          });
+          await entersState(connection, VoiceConnectionStatus.Ready, 10000);
+          console.log(`[Bot ${botNum}] Connection is ready for playback`);
         } catch (err) {
-          console.error(`[Bot ${botNum}] Failed to create audio resource:`, err.message);
-          return;
+          console.error(`[Bot ${botNum}] Connection not ready for playback:`, err?.message || err);
+          return reply('Bot is still joining voice. Please retry in a few seconds.');
         }
-
-        // Schedule playback at synchronized time
-        const remainingDelay = Math.max(0, delay - 100);
-        setTimeout(() => {
-          console.log(`[Bot ${botNum}] Starting playback...`);
-          try {
-            stopRequested = false;
-            audioPlayCount = 0;
-            setupPlayer();
-            player.play(resource);
-            console.log(`[Bot ${botNum}] Playback started ✅`);
-          } catch (err) {
-            console.error(`[Bot ${botNum}] Failed to start playback:`, err.message);
-          }
-        }, Math.min(remainingDelay, 100));
-      });
+      }
       
+      console.log(`[Bot ${botNum}] bkst: starting shared playback`);
+      const started = await startSharedPlayback();
+      if (!started) {
+        return reply('❌ Failed to start shared playback.');
+      }
       return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED');
     }
 
@@ -734,8 +531,8 @@ tokens.forEach((token, index) => {
     if (commandName === 'status') {
       try {
         const connState = connection ? (connection.state?.status) : 'not connected';
-        const playerState = player ? (player.state?.status) : 'no player';
-        const msg = `Connection: ${connState}\nPlayer: ${playerState}`;
+        const playerState = sharedPlayer ? (sharedPlayer.state?.status) : 'no shared player';
+        const msg = `Connection: ${connState}\nShared Player: ${playerState}`;
         await reply(msg);
       } catch (e) {
         console.error(`[Bot ${botNum}] Status error:`, e.message);
@@ -787,42 +584,9 @@ tokens.forEach((token, index) => {
     }
 
     // Pre-load audio for instant playback
-    preloadAudio().catch(() => {});
+// preloadAudio removed - shared player will create resources on demand
 
-    // Auto-join and auto-start playback when environment variables are set.
-    try {
-      const envChannel = process.env[`AUTO_JOIN_CHANNEL_ID_${botNum}`] || process.env.AUTO_JOIN_CHANNEL_ID;
-      if (envChannel) {
-        try {
-          const targetChannel = await client.channels.fetch(envChannel).catch(() => null);
-          if (!targetChannel || !targetChannel.isVoiceBased && !targetChannel.isStageBased) {
-            console.warn(`[Bot ${botNum}] AUTO_JOIN: channel ${envChannel} not found or not a voice channel`);
-          } else {
-            console.log(`[Bot ${botNum}] AUTO_JOIN: joining channel ${envChannel}`);
-            connection = joinVoiceChannel({
-              channelId: targetChannel.id,
-              guildId: targetChannel.guild.id,
-              adapterCreator: targetChannel.guild.voiceAdapterCreator,
-              selfDeaf: true,
-              group: client.user.id
-            });
-            connection.on('error', err => {
-              console.error(`[Bot ${botNum}] AUTO VOICE CONNECTION ERROR:`, err?.message || err);
-            });
-            console.log(`[Bot ${botNum}] AUTO JOINED channel ${envChannel}`);
-            try {
-              await entersState(connection, VoiceConnectionStatus.Ready, 15000);
-              console.log(`[Bot ${botNum}] AUTO VOICE READY`);
-              startPlayback();
-            } catch (err) {
-              console.error(`[Bot ${botNum}] AUTO startPlayback failed:`, err?.message || err);
-            }
-          }
-        } catch (e) {
-          console.error(`[Bot ${botNum}] AUTO_JOIN error:`, e.message);
-        }
-      }
-    } catch (e) {}
+    // No automatic voice join or playback on ready. Voice control happens only through commands.
   });
 
   client.on('interactionCreate', async interaction => {
